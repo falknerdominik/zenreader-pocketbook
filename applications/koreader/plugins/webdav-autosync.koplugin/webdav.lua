@@ -1,0 +1,502 @@
+--[[--
+WebDAV client for KOReader plugin.
+Uses PROPFIND to list files and GET to download.
+Matches KOReader's apps/cloudstorage/webdavapi.lua: socket.http, user/password in request table.
+--]]--
+
+local ltn12 = require("ltn12")
+local http = require("socket.http")
+local logger = require("logger")
+local util = require("util")
+-- Use KOReader's socketutil for timeouts (same as WebDavApi)
+local socketutil
+local ok_su = pcall(function() socketutil = require("socketutil") end)
+if not ok_su or not socketutil then socketutil = false end
+
+--- URL encode a string (encode spaces and special characters)
+local function url_encode(str)
+    if not str then return "" end
+    str = str:gsub("([^%w%-%.%_%~%/:])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+    return str
+end
+
+local function normalize_url(url)
+    if not url or type(url) ~= "string" then return "" end
+    url = url:gsub("^%s+", ""):gsub("%s+$", ""):gsub("/*$", "")
+    if url == "" then return "" end
+    if not url:match("^https?://") then
+        url = "https://" .. url
+    end
+    return url
+end
+
+--- Return true if URL has a non-empty host (e.g. https://host/path -> true).
+local function url_has_host(url)
+    local u = normalize_url(url)
+    if u == "" then return false end
+    local host = u:match("^https?://([^/%s]+)")
+    return host and host ~= ""
+end
+
+--- PROPFIND body. Mirrors KOReader's apps/cloudstorage/webdavapi.lua at
+--- v2026.03 (prefixed namespace, explicit <prop> list rather than <allprop/>),
+--- extended with getetag and getlastmodified because two-way sync needs them
+--- for change detection. Some strict WebDAV servers (e.g. certain ownCloud
+--- builds and some hosted providers) return 400 Bad Request on <allprop/>,
+--- so the explicit list isn't optional.
+local PROPFIND_BODY = '<?xml version="1.0"?>' ..
+    '<a:propfind xmlns:a="DAV:">' ..
+        '<a:prop>' ..
+            '<a:resourcetype/>' ..
+            '<a:getcontentlength/>' ..
+            '<a:getetag/>' ..
+            '<a:getlastmodified/>' ..
+        '</a:prop>' ..
+    '</a:propfind>'
+
+local MONTHS = {
+    Jan=1, Feb=2, Mar=3, Apr=4, May=5, Jun=6,
+    Jul=7, Aug=8, Sep=9, Oct=10, Nov=11, Dec=12,
+}
+
+--- Local-vs-UTC offset in seconds (positive west of GMT, e.g. +18000 in EST).
+--- Computed once at module load. KOReader's process is short-lived enough
+--- that DST transitions mid-process aren't a real concern.
+local function compute_tz_offset()
+    local now = os.time()
+    -- os.date("!*t", now) returns a table with UTC wall-clock components; passing
+    -- it to os.time interprets those components AS LOCAL TIME, so the result is
+    -- shifted from `now` by exactly the local TZ offset.
+    local utc_table = os.date("!*t", now)
+    if type(utc_table) ~= "table" then return 0 end
+    utc_table.isdst = false
+    local local_interpretation = os.time(utc_table)
+    if type(local_interpretation) ~= "number" then return 0 end
+    return math.floor(os.difftime(local_interpretation, now))
+end
+local TZ_OFFSET = compute_tz_offset()
+
+--- Parse RFC 1123 HTTP-date ("Wed, 31 Oct 2025 12:34:56 GMT") to UTC epoch
+--- seconds. The header is always GMT, but os.time interprets its argument as
+--- local time, so we subtract the local TZ offset to recover the true UTC
+--- epoch. Pre-v1.7.1 the result was a local-time epoch — stable enough for
+--- comparison at one device's fixed TZ, but a TZ change (travel) would shift
+--- every previously-cached remote_mtime by the delta and trigger a mass
+--- re-download on the next sync.
+local function parse_http_date(s)
+    if not s or type(s) ~= "string" then return nil end
+    local day, mon, year, hour, minute, sec = s:match("(%d+)%s+(%a+)%s+(%d+)%s+(%d+):(%d+):(%d+)")
+    if not day then return nil end
+    local m = MONTHS[mon]
+    if not m then return nil end
+    local ok, t = pcall(os.time, {
+        year = tonumber(year), month = m, day = tonumber(day),
+        hour = tonumber(hour), min = tonumber(minute), sec = tonumber(sec),
+        isdst = false,
+    })
+    if ok and type(t) == "number" then return t - TZ_OFFSET end
+    return nil
+end
+
+--- Parse PROPFIND XML response into list of { href, href_raw, is_collection,
+--- path, etag, mtime }. Accept any namespace prefix like WebDavApi
+--- (<*:response>, <*:href>, etc.).
+---
+--- `href_raw` is the wire-format href as the server returned it (percent-encoded);
+--- `href` and `path` are the percent-DECODED forms used for filename matching
+--- and local-path comparisons. Any code that issues a follow-up HTTP request
+--- (e.g. PROPFIND on a child collection during recursion) MUST use `href_raw`,
+--- since handing a decoded URL with literal spaces or other reserved chars
+--- to socket.http produces a malformed request line that strict servers
+--- (Koofr's HTTP frontend, for instance) reject with 400 Bad Request.
+local function parse_propfind_response(body)
+    local list = {}
+    for block in (body or ""):gmatch("<[^:]*:response[^>]*>.-</[^:]*:response>") do
+        local href_raw = block:match("<[^:]*:href[^>]*>([^<]+)</[^:]*:href>")
+        if href_raw then
+            local href = href_raw:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
+            local is_collection = not not block:match("<[^:]*:collection[^/]*/>")
+            -- Normalize: remove server base and leading slashes for path
+            local path = href
+            if path:match("^https?://") then
+                path = path:gsub("^https?://[^/]+", "")
+            end
+            path = path:gsub("^/+", ""):gsub("/+$", "")
+            if path == "" then path = "/" end
+            local etag = block:match("<[^:]*:getetag[^>]*>([^<]+)</[^:]*:getetag>")
+            if etag then
+                etag = etag:gsub('^%s*"', ''):gsub('"%s*$', '')
+            end
+            local lastmod = block:match("<[^:]*:getlastmodified[^>]*>([^<]+)</[^:]*:getlastmodified>")
+            local mtime = parse_http_date(lastmod)
+            table.insert(list, {
+                href = href,
+                href_raw = href_raw,
+                is_collection = is_collection,
+                path = path,
+                etag = etag,
+                mtime = mtime,
+            })
+        end
+    end
+    return list
+end
+
+--- Send one HTTP request, threading socketutil's timeout pair around it
+--- and emitting one dbg line on the way out. Caller passes a fully-formed
+--- `request` table (already has url + method + headers + sink/source +
+--- user/password) and a label for the log line. `timeout_pair` is either
+--- nil (use socketutil's default) or `{block, total}` for the file-transfer
+--- methods.
+---
+--- Returns the same triple the original socket.skip(1, http.request(req))
+--- call produced: code, headers, status. The status string is what
+--- socket.http puts after the status code; on transport-level failure the
+--- code is a string (e.g. "timeout", "closed") and headers/status are nil.
+local function do_request(label, request, timeout_pair)
+    if socketutil and socketutil.set_timeout then
+        if timeout_pair then
+            socketutil:set_timeout(timeout_pair[1], timeout_pair[2])
+        else
+            socketutil:set_timeout()
+        end
+    end
+    local _, code, headers, status = http.request(request)
+    if socketutil and socketutil.reset_timeout then
+        socketutil:reset_timeout()
+    end
+    logger.dbg(string.format(
+        "webdav_autosync: %s url=%s status=%s",
+        label, request.url, tostring(code)))
+    return code, headers, status
+end
+
+--- List a WebDAV URL (single level). Returns list of { href, is_collection, path }.
+--- Matches KOReader WebDavApi: trailing slash on URL, empty body, Content-Length, user/password, socketutil.
+local function list_one(url, username, password, depth)
+    url = normalize_url(url)
+    if not url_has_host(url) then
+        return nil, nil, "host or service not provided, or not known"
+    end
+    if url:sub(-1) ~= "/" then url = url .. "/" end
+    depth = depth or "1"
+    local body = {}
+    local code, _, status = do_request(
+        "PROPFIND", {
+            url = url,
+            method = "PROPFIND",
+            headers = {
+                ["Content-Type"] = "application/xml",
+                ["Depth"] = depth,
+                ["Content-Length"] = #PROPFIND_BODY,
+            },
+            source = ltn12.source.string(PROPFIND_BODY),
+            sink = ltn12.sink.table(body),
+            user = (username and username ~= "") and username or nil,
+            password = (password and password ~= "") and password or nil,
+        })
+    local body_str = table.concat(body)
+    if type(code) ~= "number" or code < 200 or code > 299 then
+        -- Truncate body for the error return: servers typically reply with
+        -- multi-KB HTML on 4xx/5xx, and the caller surfaces this string in
+        -- an InfoMessage popup. Keep the first 200 chars so the dialog stays
+        -- legible; full body is still available via the dbg log above.
+        local err_msg = body_str or tostring(status) or ""
+        if #err_msg > 200 then err_msg = err_msg:sub(1, 200) .. "…" end
+        return nil, code or status, err_msg
+    end
+    local list = parse_propfind_response(body_str)
+    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " entries=" .. tostring(#list))
+    return list, code
+end
+
+--- Fetch a single resource's WebDAV properties (Depth: 0). Returns the first
+--- entry from parse_propfind_response, or nil, code/error.
+--- Used after a PUT upload to re-read the server's canonical etag/mtime so
+--- the cache matches what the next PROPFIND will return (avoids "I just
+--- uploaded but now mtime changed → redownload" loops on servers that don't
+--- echo a useful ETag from PUT).
+local function get_props(url, username, password)
+    url = normalize_url(url)
+    if not url_has_host(url) then
+        return nil, "host or service not provided, or not known"
+    end
+    -- Encode internally like download_file / upload_file / mkcol do — caller
+    -- passes a decoded URL (e.g. build_remote_url output, or an action's
+    -- remote_url). Only list_one keeps the encoded-URL contract because
+    -- list_all's recursion feeds it pre-encoded `href_raw`. Pre-v1.5.4 the
+    -- missing encode here meant the post-PUT property re-fetch silently
+    -- 400'd on any filename containing spaces or other reserved chars; the
+    -- cache then carried `etag_from_put` but no `remote_mtime`.
+    url = url_encode(url)
+    local body = {}
+    local code = do_request(
+        "PROPFIND depth=0", {
+            url = url,
+            method = "PROPFIND",
+            headers = {
+                ["Content-Type"] = "application/xml",
+                ["Depth"] = "0",
+                ["Content-Length"] = #PROPFIND_BODY,
+            },
+            source = ltn12.source.string(PROPFIND_BODY),
+            sink = ltn12.sink.table(body),
+            user = (username and username ~= "") and username or nil,
+            password = (password and password ~= "") and password or nil,
+        })
+    if type(code) ~= "number" or code < 200 or code > 299 then
+        return nil, code
+    end
+    local list = parse_propfind_response(table.concat(body))
+    logger.dbg("webdav_autosync: PROPFIND depth=0 url=" .. url .. " entries=" .. tostring(#list))
+    return list[1]
+end
+
+--- Hosts that returned a hard refusal to PROPFIND Depth: infinity (4xx/5xx)
+--- during this KOReader process. Subsequent list_all calls for those hosts
+--- skip straight to the recursive Depth: 1 fallback so we don't pay a failed
+--- request per sync. Keyed by `https://host[:port]` so multi-server users
+--- don't lose the fast path on a permissive server because a strict one
+--- refused once. Cleared at process restart, which is fine: server config
+--- changes are rare, and a stale memo only costs the recursive walk we'd
+--- have done anyway pre-v1.7.0.
+local infinity_unsupported = {}
+
+--- Collect all file URLs under base_url. Returns flat list of
+--- { href, href_raw, is_collection, path, href_full } for all resources.
+--- `href_full` is the absolute decoded URL (compatible with existing
+--- download_file/upload_file consumers, which re-encode via url_encode).
+---
+--- Fast path: one PROPFIND with `Depth: infinity` returns the entire
+--- subtree in a single round trip. On a library with N book directories
+--- and N sidecar directories that's 1 request instead of ~2N+1, dominating
+--- planning time on Resume / startup. Falls back to the legacy recursive
+--- Depth: 1 walk when the server refuses (some hosted providers return
+--- 403, 507 Insufficient Storage, or 501 Not Implemented; we don't try
+--- to enumerate them — any 4xx/5xx triggers fallback and is memoed).
+--- The recursion itself uses the raw (percent-encoded) form as the request
+--- URL so strict servers don't 400 on paths containing spaces or other
+--- reserved chars.
+local function list_all(base_url, username, password)
+    base_url = normalize_url(base_url)
+    local base_domain = base_url:match("^(https?://[^/]+)") or ""
+
+    if base_domain ~= "" and not infinity_unsupported[base_domain] then
+        local list, code, err = list_one(base_url, username, password, "infinity")
+        if list then
+            -- Same self-skip key derivation as the recursive path: the
+            -- request URL's own entry must not be re-emitted as a child.
+            local req_path = base_url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
+            req_path = req_path:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
+            local all = {}
+            for _, e in ipairs(list) do
+                local href_full = e.href
+                if not href_full:match("^https?://") then
+                    href_full = base_domain .. (href_full:gsub("^/+", "/"))
+                end
+                local e_path_norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
+                if e_path_norm ~= req_path and e_path_norm ~= "" then
+                    e.href_full = href_full
+                    table.insert(all, e)
+                end
+            end
+            logger.dbg("webdav_autosync: list_all depth=infinity entries=" .. tostring(#all))
+            return all
+        end
+        if type(code) == "number" and code >= 400 and code < 500 then
+            -- 4xx is a hard refusal — config-level, won't change in this
+            -- process: 403 Forbidden, 501 Not Implemented (yes, 501 is 5xx
+            -- but it's also config-level — see below), 405 Method Not
+            -- Allowed, etc. Memo the host so subsequent syncs skip the
+            -- failed request.
+            logger.info("webdav_autosync: list_all depth=infinity refused status=" .. tostring(code)
+                .. " host=" .. base_domain .. " — falling back to recursive Depth: 1")
+            infinity_unsupported[base_domain] = true
+        elseif type(code) == "number" and code == 501 then
+            -- 501 Not Implemented is structurally a permanent refusal.
+            logger.info("webdav_autosync: list_all depth=infinity refused status=501 host="
+                .. base_domain .. " — falling back to recursive Depth: 1")
+            infinity_unsupported[base_domain] = true
+        elseif type(code) == "number" and code >= 500 and code < 600 then
+            -- Other 5xx (502, 503, 504, 507) is typically transient — overload,
+            -- maintenance window, quota throttling. Don't memo: a network blip
+            -- or a single 503 should not permanently disable the fast path
+            -- for the rest of the process. Recursive fallback will retry on
+            -- the next sync's first PROPFIND anyway.
+            logger.info("webdav_autosync: list_all depth=infinity transient status=" .. tostring(code)
+                .. " host=" .. base_domain .. " — trying recursive (will retry fast path next sync)")
+        else
+            -- Non-HTTP failure (timeout, DNS, auth string from socket layer).
+            -- Don't memo — the recursive fallback will likely hit the same
+            -- error and surface it to the caller. Pre-v1.7.0 behavior.
+            logger.dbg("webdav_autosync: list_all depth=infinity error code=" .. tostring(code)
+                .. " err=" .. tostring(err) .. " — trying recursive")
+        end
+    end
+
+    local all = {}
+    local function recurse(url)
+        local list, code, err = list_one(url, username, password, "1")
+        if not list then
+            return nil, code, err
+        end
+        -- Self-skip key: e.path is decoded, so decode the request URL's path
+        -- the same way before comparing. Otherwise a recursive call (whose
+        -- url is encoded) would never match its own decoded e.path entry,
+        -- the parent would re-list itself, and infinite recursion would only
+        -- be averted by an eventual server error.
+        local url_path = url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
+        url_path = url_path:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
+        for _, e in ipairs(list) do
+            local href_full = e.href
+            if not href_full:match("^https?://") and base_domain ~= "" then
+                href_full = base_domain .. (href_full:gsub("^/+", "/"))
+            end
+            local href_request = e.href_raw or e.href
+            if not href_request:match("^https?://") and base_domain ~= "" then
+                href_request = base_domain .. (href_request:gsub("^/+", "/"))
+            end
+            local e_path_norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
+            if e_path_norm ~= url_path and e_path_norm ~= "" then
+                e.href_full = href_full
+                table.insert(all, e)
+                if e.is_collection then
+                    local ok, c, m = recurse(href_request)
+                    if not ok then return nil, c, m end
+                end
+            end
+        end
+        return true
+    end
+    local ok, c, m = recurse(base_url)
+    if not ok then return nil, c, m end
+    return all
+end
+
+--- Download one file from WebDAV URL to local path. Creates parent dirs.
+--- Returns true, or nil, error_message. Streams the response straight to
+--- disk via ltn12.sink.file — books on a typical KOReader library can be
+--- 50–500 MB and pre-v1.7.1 the response was buffered in a Lua table for
+--- the entire download, OOMing on devices with limited RAM (Kindle/Kobo
+--- often run with 256–512 MB total). Parent directories are created with
+--- util.makePath (recursive); plain lfs.mkdir failed for nested sidecar
+--- paths whose intermediate dirs hadn't been touched yet (fresh install,
+--- or first time syncing into a new subfolder). Side effect of streaming:
+--- a request that fails mid-transfer leaves a truncated file on disk,
+--- where the old buffered approach would leave nothing — we delete it on
+--- non-2xx so the next sync re-downloads cleanly rather than treating
+--- the partial file as legitimate local content.
+local function download_file(remote_url, local_path, username, password)
+    local url = url_encode(normalize_url(remote_url))
+    local dir = local_path:match("^(.+)/[^/]+$")
+    if dir then
+        local ok_mp, mp_err = util.makePath(dir)
+        if not ok_mp then return nil, mp_err end
+    end
+    local f, ferr = io.open(local_path, "wb")
+    if not f then return nil, ferr end
+    local code = do_request("GET", {
+        url = url,
+        method = "GET",
+        sink = ltn12.sink.file(f), -- closes f on EOF/error
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    }, socketutil and { socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT } or nil)
+    if type(code) ~= "number" or code ~= 200 then
+        os.remove(local_path)
+        return nil, "HTTP " .. tostring(code)
+    end
+    return true
+end
+
+--- Create a WebDAV collection (directory). Returns true on success (any 2xx
+--- — 201 Created is the spec response, but some servers reply 200 OK if the
+--- collection already exists), or 405 Method Not Allowed (RFC 4918's "already
+--- a collection here"). Returns nil, error_message otherwise.
+local function mkcol(remote_url, username, password)
+    local url = url_encode(normalize_url(remote_url))
+    if url:sub(-1) ~= "/" then url = url .. "/" end
+    local body = {}
+    local code = do_request("MKCOL", {
+        url = url,
+        method = "MKCOL",
+        sink = ltn12.sink.table(body),
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    })
+    if type(code) == "number" and ((code >= 200 and code < 300) or code == 405) then
+        return true
+    end
+    return nil, "HTTP " .. tostring(code)
+end
+
+--- Ensure every parent collection of `rel_path` exists under `server_url`.
+--- Idempotent: existing collections (HTTP 405) are treated as success.
+--- Returns true on success, or nil, error_message.
+local function ensure_remote_dirs(server_url, rel_path, username, password)
+    if not rel_path or rel_path == "" then return true end
+    local parts = {}
+    for segment in rel_path:gmatch("[^/]+") do
+        table.insert(parts, segment)
+    end
+    if #parts < 2 then return true end -- no subdirectories to create
+    local base = normalize_url(server_url):gsub("/+$", "")
+    local accum = base
+    for i = 1, #parts - 1 do
+        accum = accum .. "/" .. parts[i]
+        local ok, err = mkcol(accum, username, password)
+        if not ok then return nil, err end
+    end
+    return true
+end
+
+--- Upload a local file to WebDAV via PUT. Returns true, etag_or_nil on success,
+--- or nil, error_message on failure. Creates parent collections as needed.
+--- Caller must pass an absolute local_path; every in-tree caller does
+--- (the planner builds them as `local_folder .. "/" .. rel`, where
+--- local_folder comes from the user's PathChooser pick which is always
+--- absolute).
+local function upload_file(remote_url, local_path, username, password)
+    local f, ferr = io.open(local_path, "rb")
+    if not f then return nil, ferr end
+    local size = f:seek("end") or 0
+    f:seek("set", 0)
+
+    local url = url_encode(normalize_url(remote_url))
+    local response_body = {}
+    logger.dbg("webdav_autosync: PUT prepare url=" .. url .. " size=" .. tostring(size))
+    local code, headers = do_request("PUT", {
+        url = url,
+        method = "PUT",
+        headers = {
+            ["Content-Length"] = tostring(size),
+            ["Content-Type"] = "application/octet-stream",
+        },
+        source = ltn12.source.file(f),
+        sink = ltn12.sink.table(response_body),
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    }, socketutil and { socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT } or nil)
+    if type(code) ~= "number" or code < 200 or code > 299 then
+        return nil, "HTTP " .. tostring(code)
+    end
+    local etag = headers and (headers.etag or headers.ETag)
+    if etag then etag = etag:gsub('^%s*"', ''):gsub('"%s*$', '') end
+    return true, etag
+end
+
+return {
+    normalize_url = normalize_url,
+    url_has_host = url_has_host,
+    url_encode = url_encode,
+    list_one = list_one,
+    list_all = list_all,
+    download_file = download_file,
+    upload_file = upload_file,
+    mkcol = mkcol,
+    ensure_remote_dirs = ensure_remote_dirs,
+    get_props = get_props,
+    parse_http_date = parse_http_date,
+}
