@@ -14,9 +14,6 @@ $RECYCLE.BIN/
 *.swp
 *.swo
 *~
-.project
-.classpath
-.settings/
 
 # Logs
 *.log
@@ -26,22 +23,6 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Environment / secrets
-.env
-.env.*
-!.env.example
-*.local
-
-# Dependencies
-node_modules/
-vendor/
-
-# Build outputs
-dist/
-build/
-out/
-target/
-obj/
 
 # Cache / temp files
 .cache/
@@ -51,70 +32,12 @@ temp/
 *.tmp
 *.temp
 
-# Coverage
-coverage/
-.coverage
-htmlcov/
-.nyc_output/
-
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-
-# Java / JVM
-*.class
-*.jar
-*.war
-*.ear
-.gradle/
-
-# Maven
-.mvn/wrapper/maven-wrapper.jar
-
-# Gradle
-.gradle/
-build/
-
-# Node / JS package managers
-.pnpm-store/
-.yarn/
-.yarn-cache/
-# Uncomment if your project does not want lockfiles tracked:
-
 # Mac/Linux archives and backups
 *.bak
 *.backup
 *.old
 *.orig
 
-# Large/archive files
-*.zip
-*.tar
-*.tar.gz
-*.tgz
-*.rar
-*.7z
-
-# Docker
-.docker/
-
-# Terraform
-.terraform/
-*.tfstate
-*.tfstate.*
-.terraform.lock.hcl
-
-# Database / local data
-*.sqlite
-*.sqlite3
-*.db
 
 # Git LFS cache
 .git/lfs/
