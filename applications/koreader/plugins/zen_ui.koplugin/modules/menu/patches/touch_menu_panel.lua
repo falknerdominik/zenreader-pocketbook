@@ -1,0 +1,338 @@
+local M = {}
+
+local active_plugin
+
+local function get_shared(key)
+    local SharedState = require("common/shared_state")
+    return SharedState.get(active_plugin, key)
+end
+
+local function in_panel_mode(tm)
+    return tm
+        and tm._zen_panel_refs ~= nil
+        and tm.item_table ~= nil
+        and tm.item_table.panel ~= nil
+end
+
+local function handle_panel_gesture(touch_menu, ges, is_hold)
+    local refs = touch_menu._zen_panel_refs
+    if not refs then return false end
+
+    if not is_hold then
+        for _i, sr in ipairs(refs.sliders or {}) do
+            if sr.slider:handleTap(ges) then return true end
+        end
+    end
+
+    if not is_hold then
+        for _i, tr in ipairs(refs.toggles or {}) do
+            if tr.toggle.dimen and ges.pos:intersectWith(tr.toggle.dimen) then
+                tr.callback()
+                return true
+            end
+        end
+    end
+
+    for _i, btn_ref in ipairs(refs.buttons or {}) do
+        if btn_ref.widget.dimen and ges.pos:intersectWith(btn_ref.widget.dimen) then
+            local require_hold = type(refs.require_hold) == "function"
+                and refs.require_hold()
+                or refs.require_hold == true
+            if require_hold then
+                if is_hold and btn_ref.callback then
+                    btn_ref.callback(touch_menu)
+                end
+                return true
+            end
+            if is_hold and btn_ref.hold_callback then
+                btn_ref.hold_callback(touch_menu)
+                return true
+            elseif not is_hold and btn_ref.callback then
+                btn_ref.callback(touch_menu)
+                return true
+            elseif not is_hold then
+                return true
+            end
+            return false
+        end
+    end
+
+    return false
+end
+
+function M.install(plugin)
+    active_plugin = plugin or active_plugin or rawget(_G, "__ZEN_UI_PLUGIN")
+
+    local TouchMenu = require("ui/widget/touchmenu")
+    if TouchMenu.__zen_touch_menu_panel_patched then
+        return
+    end
+    TouchMenu.__zen_touch_menu_panel_patched = true
+
+    local Device = require("device")
+    local Event = require("ui/event")
+    local FocusManager = require("ui/widget/focusmanager")
+    local Geom = require("ui/geometry")
+    local GestureRange = require("ui/gesturerange")
+    local T = require("ffi/util").template
+    local UIManager = require("ui/uimanager")
+    local ZenSlider = require("common/ui/zen_slider")
+    local _ = require("gettext")
+    local Screen = Device.screen
+
+    local orig_init = TouchMenu.init
+    function TouchMenu:init()
+        orig_init(self)
+        if self.bar and type(self.bar.icon_widgets) == "table" then
+            for _i, btn in ipairs(self.bar.icon_widgets) do
+                if btn and btn.image and not btn.image.dimen then
+                    local ok_sz, sz = pcall(function() return btn.image:getSize() end)
+                    if ok_sz and sz then
+                        btn.image.dimen = Geom:new{ w = sz.w, h = sz.h }
+                    end
+                end
+            end
+        end
+
+        local sw = (self.screen_size and self.screen_size.w) or Screen:getWidth()
+        local sh = (self.screen_size and self.screen_size.h) or Screen:getHeight()
+        self.ges_events.HoldCloseAllMenus = {
+            GestureRange:new{
+                ges = "hold",
+                range = Geom:new{ x = 0, y = 0, w = sw, h = sh },
+            }
+        }
+        self.ges_events.PanCloseAllMenus = {
+            GestureRange:new{
+                ges = "pan",
+                range = Geom:new{ x = 0, y = 0, w = sw, h = sh },
+            }
+        }
+        self.ges_events.PanReleaseCloseAllMenus = {
+            GestureRange:new{
+                ges = "pan_release",
+                range = Geom:new{ x = 0, y = 0, w = sw, h = sh },
+            }
+        }
+        self.ges_events.MultiSwipe = {
+            GestureRange:new{
+                ges = "multiswipe",
+                range = Geom:new{ x = 0, y = 0, w = sw, h = sh },
+            }
+        }
+    end
+
+    local orig_updateItems = TouchMenu.updateItems
+    function TouchMenu:updateItems(target_page, target_item_id)
+        if not self.item_table or not self.item_table.panel then
+            local cancelPanelRefresh = get_shared("cancelPanelRefresh")
+            if type(cancelPanelRefresh) == "function" then
+                cancelPanelRefresh(self)
+            end
+            self._zen_panel_refs = nil
+            return orig_updateItems(self, target_page, target_item_id)
+        end
+
+        if not self._zen_panel_refs then
+            self._zen_panel_locked = true
+            UIManager:scheduleIn(0.35, function()
+                self._zen_panel_locked = false
+            end)
+        end
+
+        local old_selected
+        if self.selected then
+            old_selected = { x = self.selected.x, y = self.selected.y }
+        end
+        self.item_group:clear()
+        self.layout = {}
+        table.insert(self.item_group, self.bar)
+        table.insert(self.layout, self.bar.icon_widgets)
+
+        local panel_fn = self.item_table.panel
+        local panel = type(panel_fn) == "function" and panel_fn(self) or panel_fn
+        table.insert(self.item_group, panel)
+
+        local refs = self._zen_panel_refs
+        if refs and type(refs.layout_rows) == "table" then
+            for _i, row in ipairs(refs.layout_rows) do
+                if type(row) == "table" and #row > 0 then
+                    table.insert(self.layout, row)
+                end
+            end
+        elseif refs and refs.button_layout_row and #refs.button_layout_row > 0 then
+            table.insert(self.layout, refs.button_layout_row)
+        end
+
+        table.insert(self.item_group, self.footer_top_margin)
+        table.insert(self.item_group, self.footer)
+        local page = refs and refs.page or 1
+        local page_num = refs and refs.page_num or 1
+        if page_num > 1 then
+            self.page_info_text:setText(T(_("Page %1 of %2"), page, page_num))
+        else
+            self.page_info_text:setText("")
+        end
+        self.page_info_left_chev:showHide(page_num > 1)
+        self.page_info_right_chev:showHide(page_num > 1)
+        self.page_info_left_chev:enableDisable(page > 1)
+        self.page_info_right_chev:enableDisable(page < page_num)
+
+        local schedulePanelRefresh = get_shared("schedulePanelRefresh")
+        if type(schedulePanelRefresh) == "function" then
+            schedulePanelRefresh(self)
+        end
+
+        local old_dimen = self.dimen:copy()
+        self.dimen.w = self.width
+        self.dimen.h = self.item_group:getSize().h + self.bordersize * 2 + self.padding
+        if old_selected then
+            local row = self.layout[old_selected.y]
+            if row and row[old_selected.x] then
+                self:moveFocusTo(old_selected.x, old_selected.y, 0)
+            else
+                self:moveFocusTo(self.cur_tab, 1, FocusManager.NOT_FOCUS)
+            end
+        else
+            self:moveFocusTo(self.cur_tab, 1, FocusManager.NOT_FOCUS)
+        end
+
+        local keep_bg = old_dimen and self.dimen.h >= old_dimen.h
+        UIManager:setDirty((self.is_fresh or keep_bg) and self.show_parent or "all", function()
+            local refresh_dimen = old_dimen and old_dimen:combine(self.dimen) or self.dimen
+            local refresh_type = "ui"
+            if self.is_fresh then
+                refresh_type = "flashui"
+                self.is_fresh = false
+            end
+            return refresh_type, refresh_dimen
+        end)
+    end
+
+    local orig_onTapCloseAllMenus = TouchMenu.onTapCloseAllMenus
+    function TouchMenu:onTapCloseAllMenus(arg, ges_ev)
+        if in_panel_mode(self) then
+            if self._zen_panel_locked then return true end
+            if handle_panel_gesture(self, ges_ev, false) then
+                return true
+            end
+        end
+        return orig_onTapCloseAllMenus(self, arg, ges_ev)
+    end
+
+    local orig_onHoldCloseAllMenus = TouchMenu.onHoldCloseAllMenus
+    function TouchMenu:onHoldCloseAllMenus(arg, ges_ev)
+        if in_panel_mode(self) then
+            if not self._zen_panel_locked then
+                handle_panel_gesture(self, ges_ev, true)
+            end
+            return true
+        end
+        if orig_onHoldCloseAllMenus then
+            return orig_onHoldCloseAllMenus(self, arg, ges_ev)
+        end
+    end
+
+    local function close_panel_on_resize(tm)
+        if tm and tm.item_table and tm.item_table.panel and tm.closeMenu then
+            tm:closeMenu()
+        end
+        return false
+    end
+
+    local function forward_rotation_after_close(tm, rotation)
+        close_panel_on_resize(tm)
+        local stack = UIManager._window_stack
+        local top = stack and stack[#stack] and stack[#stack].widget
+        if top and top ~= tm and top ~= tm.show_parent and type(top.handleEvent) == "function" then
+            return top:handleEvent(Event:new("SetRotationMode", rotation)) == true
+        end
+        return false
+    end
+
+    local orig_onSetRotationMode = TouchMenu.onSetRotationMode
+    function TouchMenu:onSetRotationMode(rotation, ...)
+        if rotation ~= nil and rotation ~= Screen:getRotationMode()
+                and forward_rotation_after_close(self, rotation) then
+            return true
+        end
+        if orig_onSetRotationMode then
+            return orig_onSetRotationMode(self, rotation, ...)
+        end
+        return false
+    end
+
+    local orig_onSetDimensions = TouchMenu.onSetDimensions
+    function TouchMenu:onSetDimensions(...)
+        close_panel_on_resize(self)
+        return orig_onSetDimensions and orig_onSetDimensions(self, ...)
+    end
+
+    local orig_onScreenResize = TouchMenu.onScreenResize
+    function TouchMenu:onScreenResize(...)
+        close_panel_on_resize(self)
+        return orig_onScreenResize and orig_onScreenResize(self, ...)
+    end
+
+    ZenSlider.installTouchMenuHooks(TouchMenu, {
+        in_panel_mode = function(tm)
+            local refs = tm._zen_panel_refs
+            return in_panel_mode(tm)
+                and type(refs.sliders) == "table"
+                and #refs.sliders > 0
+        end,
+        get_sliders = function(tm)
+            local refs = tm._zen_panel_refs
+            if not refs then return {} end
+            local sliders = {}
+            for _i, sr in ipairs(refs.sliders or {}) do
+                table.insert(sliders, sr.slider)
+            end
+            return sliders
+        end,
+        is_locked           = function(tm) return tm._zen_panel_locked end,
+        swipe_fallback      = function(tm, ges) handle_panel_gesture(tm, ges, false) end,
+        multiswipe_fallback = function(tm, ges) handle_panel_gesture(tm, ges, false) end,
+    })
+
+    local orig_onCloseWidget = TouchMenu.onCloseWidget
+    function TouchMenu:onCloseWidget()
+        local cancelPanelRefresh = get_shared("cancelPanelRefresh")
+        if type(cancelPanelRefresh) == "function" then
+            cancelPanelRefresh(self)
+        end
+        self._zen_panel_refs = nil
+        self._zen_panel_opening_pan = false
+        if orig_onCloseWidget then orig_onCloseWidget(self) end
+    end
+
+    local function panel_goto(self, dir)
+        local refs = self._zen_panel_refs
+        if refs and type(refs.goto_page) == "function" then
+            refs.goto_page((refs.page or 1) + dir)
+        end
+        return true
+    end
+
+    local orig_onPrevPage = TouchMenu.onPrevPage
+    if orig_onPrevPage then
+        function TouchMenu:onPrevPage()
+            if self.item_table and self.item_table.panel then
+                return panel_goto(self, -1)
+            end
+            return orig_onPrevPage(self)
+        end
+    end
+
+    local orig_onNextPage = TouchMenu.onNextPage
+    if orig_onNextPage then
+        function TouchMenu:onNextPage()
+            if self.item_table and self.item_table.panel then
+                return panel_goto(self, 1)
+            end
+            return orig_onNextPage(self)
+        end
+    end
+end
+
+return M

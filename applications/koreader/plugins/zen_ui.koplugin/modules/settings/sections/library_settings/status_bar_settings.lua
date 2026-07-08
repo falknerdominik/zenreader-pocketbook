@@ -1,0 +1,329 @@
+-- settings/sections/library/status_bar.lua
+-- Status bar settings item for Zen UI.
+-- Returns a single menu-item table: { text = _("Status bar"), sub_item_table = {...} }
+-- Receives ctx: { config, save_and_apply }
+
+local _ = require("gettext")
+local UIManager = require("ui/uimanager")
+local utils = require("modules/settings/zen_settings_utils")
+local constants = require("common/constants")
+
+local M = {}
+
+function M.build(ctx)
+    local config        = ctx.config
+    local save_and_apply = ctx.save_and_apply
+
+    local function save_and_apply_status_bar() save_and_apply("status_bar") end
+
+    local function make_enable_feature_item(feature, text)
+        return utils.make_enable_feature_item(feature, text, config, save_and_apply)
+    end
+
+    -- -------------------------------------------------------------------------
+    -- Slot items (deduplicates left / center / right)
+    -- -------------------------------------------------------------------------
+
+    local status_bar_all_items = {
+        { key = "wifi",        text = _("Wi-Fi")       },
+        { key = "disk",        text = _("Disk space")  },
+        { key = "ram",         text = _("RAM usage")   },
+        { key = "frontlight",  text = _("Brightness")  },
+        { key = "battery",     text = _("Battery")     },
+        { key = "time",        text = _("Time")        },
+        { key = "custom_text", text = _("Custom text") },
+    }
+
+    -- Append items registered by external plugins via
+    -- _G.__ZEN_UI_REGISTER_STATUS_ITEM so they are placeable from this UI.
+    local ext_registry = rawget(_G, "__ZEN_UI_STATUS_ITEMS")
+    if type(ext_registry) == "table" then
+        for key, entry in pairs(ext_registry) do
+            if type(entry) == "table" and type(entry.fetch) == "function" then
+                table.insert(status_bar_all_items, {
+                    key  = key,
+                    text = type(entry.label) == "string" and entry.label or key,
+                })
+            end
+        end
+    end
+
+    -- Canonical positions within each slot: items are inserted at the slot
+    -- position matching this order when the user enables them, rather than
+    -- always appending to the end.
+    local CANONICAL_ORDERS = {
+        left   = { "time", "custom_text" },
+        center = {},
+        right  = { "custom_text", "disk", "ram", "frontlight", "wifi", "battery" },
+    }
+
+    local function make_status_bar_slot_items(slot_name, arrange_title)
+        local order_key = slot_name .. "_order"
+        local canonical = CANONICAL_ORDERS[slot_name] or {}
+        local canon_pos = {}
+        for i, k in ipairs(canonical) do canon_pos[k] = i end
+        local other_keys = {}
+        for _, s in ipairs({ "left", "center", "right" }) do
+            if s ~= slot_name then
+                table.insert(other_keys, s .. "_order")
+            end
+        end
+
+        local t = {
+            {
+                text = _("Arrange"),
+                keep_menu_open = true,
+                separator = true,
+                callback = function()
+                    local SortWidget = require("ui/widget/sortwidget")
+                    local lbl = {}
+                    for _, d in ipairs(status_bar_all_items) do lbl[d.key] = d.text end
+                    local sort_items = {}
+                    for _, key in ipairs(config.status_bar[order_key] or {}) do
+                        if lbl[key] then
+                            table.insert(sort_items, { text = lbl[key], orig_item = key })
+                        end
+                    end
+                    UIManager:show(SortWidget:new{
+                        title = arrange_title,
+                        item_table = sort_items,
+                        callback = function()
+                            local new_order = {}
+                            for _, item in ipairs(sort_items) do
+                                table.insert(new_order, item.orig_item)
+                            end
+                            config.status_bar[order_key] = new_order
+                            save_and_apply_status_bar()
+                        end,
+                    })
+                end,
+            },
+        }
+
+        for _, def in ipairs(status_bar_all_items) do
+            local key = def.key
+            table.insert(t, {
+                text = def.text,
+                keep_menu_open = true,
+                enabled_func = function()
+                    -- Disable if already active in another slot.
+                    for _, other_key in ipairs(other_keys) do
+                        for _, k in ipairs(config.status_bar[other_key] or {}) do
+                            if k == key then return false end
+                        end
+                    end
+                    return true
+                end,
+                checked_func = function()
+                    for _, k in ipairs(config.status_bar[order_key] or {}) do
+                        if k == key then return true end
+                    end
+                    return false
+                end,
+                callback = function(touchmenu_instance)
+                    local this_order = config.status_bar[order_key] or {}
+                    local found = false
+                    local new_this = {}
+                    for _, k in ipairs(this_order) do
+                        if k == key then found = true else table.insert(new_this, k) end
+                    end
+                    if found then
+                        config.status_bar[order_key] = new_this
+                    else
+                        for _, other_key in ipairs(other_keys) do
+                            local new_other = {}
+                            for _, k in ipairs(config.status_bar[other_key] or {}) do
+                                if k ~= key then table.insert(new_other, k) end
+                            end
+                            config.status_bar[other_key] = new_other
+                        end
+                        -- Insert at the canonical position rather than appending.
+                        local new_key_canon = canon_pos[key] or math.huge
+                        local insert_at = #this_order + 1
+                        for i, k in ipairs(this_order) do
+                            if (canon_pos[k] or math.huge) > new_key_canon then
+                                insert_at = i
+                                break
+                            end
+                        end
+                        table.insert(this_order, insert_at, key)
+                        config.status_bar[order_key] = this_order
+                    end
+                    -- Repaint the menu's checkmarks before the deferred reinit fires,
+                    -- preventing ghost artifacts from the old checked state.
+                    if touchmenu_instance then
+                        touchmenu_instance:updateItems()
+                    end
+                    save_and_apply_status_bar()
+                end,
+            })
+        end
+        return t
+    end
+
+    -- -------------------------------------------------------------------------
+    -- Status bar item
+    -- -------------------------------------------------------------------------
+
+    return {
+        text = _("Status bar"),
+        sub_item_table = {
+            make_enable_feature_item("status_bar", _("Enable custom status bar")),
+            {
+                text_func = function()
+                    local name = config.status_bar.custom_text
+                    if name == nil or name == "" then
+                        name = require("device").model or ""
+                    end
+                    return _("Custom text: ") .. name
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local InputDialog = require("ui/widget/inputdialog")
+                    local Device = require("device")
+                    local dlg
+                    dlg = InputDialog:new{
+                        title = _("Custom text"),
+                        input = config.status_bar.custom_text or "",
+                        hint = Device.model or "",
+                        buttons = {{
+                            {
+                                text = _("Cancel"),
+                                id = "close",
+                                callback = function() UIManager:close(dlg) end,
+                            },
+                            {
+                                text = _("Set"),
+                                is_enter_default = true,
+                                callback = function()
+                                    config.status_bar.custom_text = dlg:getInputText()
+                                    UIManager:close(dlg)
+                                    save_and_apply_status_bar()
+                                    if touchmenu_instance then
+                                        touchmenu_instance:updateItems()
+                                    end
+                                end,
+                            },
+                        }},
+                    }
+                    UIManager:show(dlg)
+                    dlg:onShowKeyboard()
+                end,
+            },
+            {
+                text = _("Show bottom border"),
+                checked_func = function() return config.status_bar.show_bottom_border == true end,
+                callback = function()
+                    config.status_bar.show_bottom_border = config.status_bar.show_bottom_border ~= true
+                    save_and_apply_status_bar()
+                end,
+            },
+            {
+                text = _("Bold text"),
+                checked_func = function() return config.status_bar.bold_text == true end,
+                callback = function()
+                    config.status_bar.bold_text = config.status_bar.bold_text ~= true
+                    save_and_apply_status_bar()
+                end,
+            },
+            {
+                text = _("Colored status icons"),
+                checked_func = function() return config.status_bar.colored == true end,
+                callback = function()
+                    config.status_bar.colored = config.status_bar.colored ~= true
+                    save_and_apply_status_bar()
+                end,
+            },
+            {
+                text = _("Left items"),
+                sub_item_table = make_status_bar_slot_items("left", _("Arrange left items")),
+            },
+            {
+                text = _("Center items"),
+                sub_item_table = make_status_bar_slot_items("center", _("Arrange center items")),
+            },
+            {
+                text = _("Right items"),
+                sub_item_table = make_status_bar_slot_items("right", _("Arrange right items")),
+            },
+            {
+                text_func = function()
+                    local key = config.status_bar.separator_key or "dot"
+                    for _i, s in ipairs(constants.SEPARATOR_PRESETS) do
+                        if s.key == key then
+                            return _("Separator: ") .. _(s.label)
+                        end
+                    end
+                    return _("Separator: ") .. key
+                end,
+                sub_item_table = (function()
+                    -- Preview strings per key (bar-specific spacing).
+                    local preview = {
+                        dot             = "  \xC2\xB7  ",
+                        bar             = "  |  ",
+                        dash            = "  -  ",
+                        bullet          = "  \xE2\x80\xA2  ",
+                        space           = "   ",
+                        ["small-space"] = " ",
+                        none            = "",
+                    }
+                    local sub = {}
+                    for _i, sep in ipairs(constants.SEPARATOR_PRESETS) do
+                        local key = sep.key
+                        if key == "custom" then
+                            table.insert(sub, {
+                                text_func = function()
+                                    return _("Custom") .. "  '" .. (config.status_bar.custom_separator or "") .. "'"
+                                end,
+                                checked_func = function() return config.status_bar.separator_key == "custom" end,
+                                callback = function(touchmenu_instance)
+                                    local InputDialog = require("ui/widget/inputdialog")
+                                    local dlg
+                                    dlg = InputDialog:new{
+                                        title = _("Custom separator"),
+                                        input = config.status_bar.custom_separator or "",
+                                        buttons = {{
+                                            {
+                                                text = _("Cancel"),
+                                                id = "close",
+                                                callback = function() UIManager:close(dlg) end,
+                                            },
+                                            {
+                                                text = _("Set"),
+                                                is_enter_default = true,
+                                                callback = function()
+                                                    config.status_bar.custom_separator = dlg:getInputText()
+                                                    config.status_bar.separator_key = "custom"
+                                                    UIManager:close(dlg)
+                                                    save_and_apply_status_bar()
+                                                    if touchmenu_instance then
+                                                        touchmenu_instance:updateItems()
+                                                    end
+                                                end,
+                                            },
+                                        }},
+                                    }
+                                    UIManager:show(dlg)
+                                    dlg:onShowKeyboard()
+                                end,
+                            })
+                        else
+                            local pv = preview[key]
+                            table.insert(sub, {
+                                text = _(sep.label) .. (pv and pv ~= "" and ("  '" .. pv .. "'") or ""),
+                                checked_func = function() return config.status_bar.separator_key == key end,
+                                callback = function()
+                                    config.status_bar.separator_key = key
+                                    save_and_apply_status_bar()
+                                end,
+                            })
+                        end
+                    end
+                    return sub
+                end)(),
+            },
+        },
+    }
+end
+
+return M

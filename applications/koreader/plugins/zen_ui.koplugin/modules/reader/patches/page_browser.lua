@@ -1,0 +1,2063 @@
+-- zen_ui: page_browser patch
+-- Intercepts swipe-north from the bottom 14% of the reader screen and
+-- opens KOReader's native PageBrowserWidget.
+
+local function apply_page_browser()
+
+    -- -----------------------------------------------------------------------
+    -- Dependencies
+    -- -----------------------------------------------------------------------
+    local UIManager    = require("ui/uimanager")
+    local Event        = require("ui/event")
+    local ZenTocWidget = require("modules/reader/zen_toc_widget")
+    local ConfigManager = require("config/manager")
+    local utils        = require("common/utils")
+
+    -- -----------------------------------------------------------------------
+    -- Resolve plugin icons/ dir from this file's path at apply-time
+    -- -----------------------------------------------------------------------
+    local _icons_dir
+    do
+        local root = require("common/plugin_root")
+        if root then _icons_dir = root .. "/icons/" end
+    end
+
+    -- -----------------------------------------------------------------------
+    -- Feature guard
+    -- -----------------------------------------------------------------------
+    -- Capture the plugin reference NOW (while __ZEN_UI_PLUGIN is set by
+    -- run_patch). After apply_page_browser() returns the global is cleared,
+    -- so reading it inside gesture handlers would always return nil.
+    local _plugin_ref = rawget(_G, "__ZEN_UI_PLUGIN")
+    ZenTocWidget.set_plugin(_plugin_ref)
+
+    local function get_page_browser_layout()
+        local cfg = _plugin_ref and _plugin_ref.config
+        if type(cfg) == "table" and type(cfg.reader_page_browser) == "table" then
+            local layout = cfg.reader_page_browser.layout
+            if layout == "single" or layout == "grid" then
+                return layout
+            end
+        end
+        local g_settings = rawget(_G, "G_reader_settings")
+        local legacy = g_settings and g_settings:readSetting("zen_page_browser_layout")
+        if legacy == "single" or legacy == "grid" then
+            return legacy
+        end
+        return "grid"
+    end
+
+    local function set_page_browser_layout(layout)
+        if layout ~= "single" and layout ~= "grid" then return end
+        if _plugin_ref and type(_plugin_ref.config) == "table" then
+            if type(_plugin_ref.config.reader_page_browser) ~= "table" then
+                _plugin_ref.config.reader_page_browser = {}
+            end
+            _plugin_ref.config.reader_page_browser.layout = layout
+            if type(_plugin_ref.saveConfig) == "function" then
+                _plugin_ref:saveConfig()
+                return
+            end
+        end
+        local ok, cfg = pcall(ConfigManager.load)
+        if not ok or type(cfg) ~= "table" then return end
+        if type(cfg.reader_page_browser) ~= "table" then
+            cfg.reader_page_browser = {}
+        end
+        cfg.reader_page_browser.layout = layout
+        pcall(ConfigManager.save, cfg)
+    end
+
+    local function is_enabled()
+        local features = _plugin_ref
+            and _plugin_ref.config
+            and _plugin_ref.config.features
+        if type(features) ~= "table" or features.page_browser ~= true then return false end
+        if features.lockdown_mode == true then
+            local lc = _plugin_ref.config.lockdown
+            if type(lc) == "table" and lc.disable_bottom_menu_swipe then return false end
+        end
+        return true
+    end
+
+    local function is_substring_enabled()
+        return G_reader_settings:readSetting("substring_search") ~= false  -- default: substring (whole-word off)
+    end
+
+    rawset(_G, "__ZEN_UI_BUILD_PAGE_BROWSER_PREVIEW", function(slot_w, slot_h)
+        local Blitbuffer      = require("ffi/blitbuffer")
+        local Device          = require("device")
+        local Font            = require("ui/font")
+        local Geom            = require("ui/geometry")
+        local IconWidget      = require("ui/widget/iconwidget")
+        local TextWidget      = require("ui/widget/textwidget")
+        local FrameContainer  = require("ui/widget/container/framecontainer")
+        local CenterContainer = require("ui/widget/container/centercontainer")
+        local HorizontalGroup = require("ui/widget/horizontalgroup")
+        local VerticalGroup   = require("ui/widget/verticalgroup")
+        local VerticalSpan    = require("ui/widget/verticalspan")
+        local OverlapGroup    = require("ui/widget/overlapgroup")
+        local LineWidget      = require("ui/widget/linewidget")
+        local ZenSlider       = require("common/ui/zen_slider")
+        local Screen          = Device.screen
+
+        local canvas = Blitbuffer.new(slot_w, slot_h, Blitbuffer.TYPE_BB8)
+        canvas:fill(Blitbuffer.COLOR_WHITE)
+
+        local function paint_icon(icon_name, file_path, x, y, size)
+            local icon = IconWidget:new{
+                file   = file_path,
+                icon   = file_path and nil or icon_name,
+                width  = size,
+                height = size,
+            }
+            icon:paintTo(canvas, x, y)
+            icon:free()
+        end
+
+        local title_h = Screen:scaleBySize(54)
+        local btn_sz  = Screen:scaleBySize(32)
+        local btn_pad = Screen:scaleBySize(11)
+        local slot_btn_w = btn_sz + btn_pad * 2
+        local title_y = math.floor((title_h - btn_sz) / 2)
+        canvas:paintRect(0, title_h - 1, slot_w, 1, Blitbuffer.COLOR_LIGHT_GRAY)
+        paint_icon("chevron.left", nil, btn_pad, title_y, btn_sz)
+
+        local toc_icon_path = _icons_dir and utils.resolveIcon(_icons_dir, "toc")
+        local right_icons = {
+            { icon = "appbar.search" },
+            { icon = "appbar.textsize" },
+            { icon = "bookmark" },
+            { icon = "appbar.navigation", file = toc_icon_path },
+        }
+        for _i, def in ipairs(right_icons) do
+            local x = slot_w - slot_btn_w * _i + btn_pad
+            paint_icon(def.icon, def.file, x, title_y, btn_sz)
+        end
+
+        local icon_size            = Screen:scaleBySize(24)
+        local skip_icon_size       = Screen:scaleBySize(36)
+        local icon_pad_h           = Screen:scaleBySize(20)
+        local icon_pad_v           = Screen:scaleBySize(10)
+        local panel_pad_v          = Screen:scaleBySize(6)
+        local panel_pad_btn        = Screen:scaleBySize(12)
+        local panel_pad_top        = Screen:scaleBySize(6)
+        local panel_pad_bottom     = Screen:scaleBySize(12)
+        local knob_r               = Screen:scaleBySize(16.5)
+        local slider_h             = knob_r * 2 + Screen:scaleBySize(6)
+        local label_face           = Font:getFace("cfont", 18)
+        local measure_label        = TextWidget:new{ text = "Chapter 1", face = label_face, padding = 0 }
+        local label_h              = measure_label:getSize().h
+        measure_label:free()
+        local btn_toggle_h         = icon_size + icon_pad_v * 2 + Screen:scaleBySize(2) * 2
+        local btn_skip_h           = skip_icon_size + icon_pad_v * 2
+        local btn_h                = math.max(btn_toggle_h, btn_skip_h)
+        local panel_h              = panel_pad_top + panel_pad_v + panel_pad_btn
+            + label_h + slider_h + btn_h + panel_pad_bottom
+
+        local top_pad = Screen:scaleBySize(6)
+        local grid_top = title_h + top_pad
+        local panel_top = math.max(grid_top, slot_h - panel_h)
+        local grid_h = math.max(Screen:scaleBySize(80), panel_top - grid_top)
+        local layout = get_page_browser_layout()
+
+        local badge_face = Font:getFace("cfont", 13)
+        local function paint_pill(bx, by, bw, bh, color)
+            local r = bh / 2
+            for row = 0, bh - 1 do
+                local dy = math.abs(row + 0.5 - r)
+                local dx = math.sqrt(math.max(0, r * r - dy * dy))
+                local x0 = math.ceil(bx + r - dx)
+                local x1 = math.floor(bx + bw - r + dx)
+                local w  = x1 - x0
+                if w > 0 then canvas:paintRect(x0, by + row, w, 1, color) end
+            end
+        end
+        local function paint_badge(page_num, bx, by, bw, bh)
+            local label = TextWidget:new{
+                text    = tostring(page_num),
+                face    = badge_face,
+                fgcolor = Blitbuffer.COLOR_WHITE,
+                padding = 0,
+            }
+            local sz = label:getSize()
+            local pv = Screen:scaleBySize(2)
+            local ph = Screen:scaleBySize(4)
+            local h = sz.h + 2 * pv
+            local w = math.max(sz.w + 2 * ph, h)
+            local x = bx + math.floor((bw - w) / 2)
+            local y = by + bh - h - Screen:scaleBySize(3)
+            paint_pill(x, y, w, h, Blitbuffer.gray(0x33))
+            label:paintTo(canvas, x + math.floor((w - sz.w) / 2), y + math.floor((h - sz.h) / 2))
+            label:free()
+        end
+        local function paint_page(page_num, cell_x, cell_y, cell_w, cell_h)
+            local page_h = math.floor(cell_h * 0.92)
+            local page_w = math.floor(page_h * 0.70)
+            if page_w > cell_w * 0.86 then
+                page_w = math.floor(cell_w * 0.86)
+                page_h = math.floor(page_w / 0.70)
+            end
+            local x = cell_x + math.floor((cell_w - page_w) / 2)
+            local y = cell_y + math.floor((cell_h - page_h) / 2)
+            canvas:paintRect(x, y, page_w, page_h, Blitbuffer.COLOR_WHITE)
+            canvas:paintBorder(x, y, page_w, page_h, Screen:scaleBySize(1), Blitbuffer.COLOR_DARK_GRAY, 0)
+            local line_h = math.max(1, Screen:scaleBySize(2))
+            local line_gap = Screen:scaleBySize(8)
+            local text_w = math.floor(page_w * 0.62)
+            local text_x = x + math.floor(page_w * 0.18)
+            local text_y = y + math.floor(page_h * 0.18)
+            for i = 0, 5 do
+                local w = (i % 3 == 2) and math.floor(text_w * 0.72) or text_w
+                canvas:paintRect(text_x, text_y + i * line_gap, w, line_h, Blitbuffer.COLOR_LIGHT_GRAY)
+            end
+            paint_badge(page_num, x, y, page_w, page_h)
+        end
+
+        if layout == "single" then
+            paint_page(42, 0, grid_top, slot_w, grid_h)
+        else
+            local cols, rows = 3, 2
+            local gap = Screen:scaleBySize(8)
+            local margin_x = Screen:scaleBySize(14)
+            local cell_w = math.floor((slot_w - 2 * margin_x - (cols - 1) * gap) / cols)
+            local cell_h = math.floor((grid_h - (rows - 1) * gap) / rows)
+            local first_page = 40
+            for row = 0, rows - 1 do
+                for col = 0, cols - 1 do
+                    local idx = row * cols + col
+                    paint_page(first_page + idx, margin_x + col * (cell_w + gap),
+                        grid_top + row * (cell_h + gap), cell_w, cell_h)
+                end
+            end
+        end
+
+        local slider_w = math.floor(slot_w * 0.70)
+        local chapter_label = TextWidget:new{
+            text      = "Chapter 1",
+            face      = label_face,
+            max_width = slider_w,
+            padding   = 0,
+        }
+        local slider = ZenSlider:new{
+            width     = slider_w,
+            value     = 42,
+            value_min = 1,
+            value_max = 240,
+        }
+
+        local grid_slide_path = _icons_dir and utils.resolveIcon(_icons_dir, "grid_slide")
+        local grid_path       = _icons_dir and utils.resolveIcon(_icons_dir, "grid")
+        local skip_left_path  = _icons_dir and utils.resolveIcon(_icons_dir, "skip_left")
+        local skip_right_path = _icons_dir and utils.resolveIcon(_icons_dir, "skip_right")
+        local is_single_page = layout == "single"
+
+        local function make_toggle_icon(icon_name, file_path, active)
+            local icon = IconWidget:new{
+                file   = file_path,
+                icon   = file_path and nil or icon_name,
+                width  = icon_size,
+                height = icon_size,
+                alpha  = not active,
+            }
+            if active then
+                icon:_render()
+                if icon._bb then
+                    local bb_copy = icon._bb:copy()
+                    bb_copy:invertRect(0, 0, bb_copy:getWidth(), bb_copy:getHeight())
+                    icon._bb = bb_copy
+                end
+            end
+            return CenterContainer:new{ dimen = Geom:new{ w = icon_size, h = icon_size }, icon }
+        end
+        local btn_view_frame = FrameContainer:new{
+            padding_top = icon_pad_v, padding_bottom = icon_pad_v,
+            padding_left = icon_pad_h, padding_right = icon_pad_h,
+            bordersize = 0,
+            background = is_single_page and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+            make_toggle_icon("grid_slide", grid_slide_path, is_single_page),
+        }
+        local btn_grid_frame = FrameContainer:new{
+            padding_top = icon_pad_v, padding_bottom = icon_pad_v,
+            padding_left = icon_pad_h, padding_right = icon_pad_h,
+            bordersize = 0,
+            background = is_single_page and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
+            make_toggle_icon("grid", grid_path, not is_single_page),
+        }
+        local divider = LineWidget:new{
+            dimen = Geom:new{ w = Screen:scaleBySize(1), h = icon_size + icon_pad_v * 2 },
+            background = Blitbuffer.COLOR_DARK_GRAY,
+            direction = "vert",
+        }
+        local btn_row = FrameContainer:new{
+            padding = 0, margin = 0, bordersize = Screen:scaleBySize(2),
+            background = Blitbuffer.COLOR_WHITE,
+            radius = Screen:scaleBySize(4),
+            HorizontalGroup:new{ align = "center", btn_view_frame, divider, btn_grid_frame },
+        }
+        local function make_skip_btn(file_path, fallback_icon)
+            return FrameContainer:new{
+                padding_top = icon_pad_v, padding_bottom = icon_pad_v,
+                padding_left = icon_pad_h, padding_right = icon_pad_h,
+                bordersize = 0,
+                background = Blitbuffer.COLOR_WHITE,
+                IconWidget:new{
+                    file = file_path,
+                    icon = file_path and nil or fallback_icon,
+                    width = skip_icon_size,
+                    height = skip_icon_size,
+                },
+            }
+        end
+        local skip_left_btn = make_skip_btn(skip_left_path, "chevron.left")
+        local skip_right_btn = make_skip_btn(skip_right_path, "chevron.right")
+        local btn_row_sz = btn_row:getSize()
+        local skip_sz = skip_left_btn:getSize()
+        local row_h = math.max(btn_row_sz.h, skip_sz.h)
+        local skip_side_gap = Screen:scaleBySize(40)
+        skip_left_btn.overlap_offset = { skip_side_gap, math.floor((row_h - skip_sz.h) / 2) }
+        skip_right_btn.overlap_offset = {
+            slot_w - skip_side_gap - skip_sz.w,
+            math.floor((row_h - skip_sz.h) / 2),
+        }
+        local btn_and_skip = OverlapGroup:new{
+            dimen = Geom:new{ w = slot_w, h = row_h },
+            allow_mirroring = false,
+            CenterContainer:new{ dimen = Geom:new{ w = slot_w, h = row_h }, btn_row },
+            skip_left_btn,
+            skip_right_btn,
+        }
+
+        local panel = FrameContainer:new{
+            width = slot_w,
+            height = panel_h,
+            padding = 0,
+            margin = 0,
+            bordersize = 0,
+            background = Blitbuffer.COLOR_WHITE,
+            VerticalGroup:new{
+                align = "center",
+                VerticalSpan:new{ width = panel_pad_top },
+                CenterContainer:new{ dimen = Geom:new{ w = slot_w, h = chapter_label:getSize().h }, chapter_label },
+                VerticalSpan:new{ width = panel_pad_v },
+                CenterContainer:new{ dimen = Geom:new{ w = slot_w, h = slider:getSize().h }, slider },
+                VerticalSpan:new{ width = panel_pad_btn },
+                btn_and_skip,
+                VerticalSpan:new{ width = panel_pad_bottom },
+            },
+        }
+        panel:paintTo(canvas, 0, panel_top)
+        if panel.free then panel:free() end
+        return canvas
+    end)
+
+    -- -----------------------------------------------------------------------
+    -- Zen UI customisations applied once to PageBrowserWidget
+    -- -----------------------------------------------------------------------
+    local _zen_pbw_patched = false
+
+    local function zen_patch_page_browser_widget()
+        if _zen_pbw_patched then return end
+        _zen_pbw_patched = true
+
+        local PageBrowserWidget = require("ui/widget/pagebrowserwidget")
+        local Device     = require("device")
+        local Font       = require("ui/font")
+        local Geom       = require("ui/geometry")
+        local IconButton = require("ui/widget/iconbutton")
+        local IconWidget = require("ui/widget/iconwidget")
+        local HorizontalGroup = require("ui/widget/horizontalgroup")
+        local VerticalGroup   = require("ui/widget/verticalgroup")
+        local VerticalSpan    = require("ui/widget/verticalspan")
+        local TextWidget      = require("ui/widget/textwidget")
+        local FrameContainer  = require("ui/widget/container/framecontainer")
+        local CenterContainer = require("ui/widget/container/centercontainer")
+        local OverlapGroup    = require("ui/widget/overlapgroup")
+        local Blitbuffer      = require("ffi/blitbuffer")
+        local Size            = require("ui/size")
+        local Screen          = Device.screen
+        local GestureRange    = require("ui/gesturerange")
+        local ZenSlider       = require("common/ui/zen_slider")
+        local ZenIconButton   = require("common/ui/zen_icon_button")
+        local logger          = require("logger")
+
+        local function get_page_display_text(pbw, page_num)
+            local fallback = tostring(page_num)
+            local pagemap = pbw.ui and pbw.ui.pagemap
+            local labels = pbw.page_labels
+            if not (pagemap and type(pagemap.wantsPageLabels) == "function"
+                and pagemap:wantsPageLabels()
+                and type(labels) == "table" and #labels > 0) then
+                return fallback
+            end
+
+            if pbw._zen_page_label_source ~= labels then
+                pbw._zen_page_label_source = labels
+                pbw._zen_page_label_text_cache = {}
+            end
+            local cache = pbw._zen_page_label_text_cache
+            if cache[page_num] then
+                return cache[page_num]
+            end
+
+            local lo, hi, best = 1, #labels, nil
+            while lo <= hi do
+                local mid = math.floor((lo + hi) / 2)
+                local item = labels[mid]
+                if item and item.page and item.page <= page_num then
+                    best = item
+                    lo = mid + 1
+                else
+                    hi = mid - 1
+                end
+            end
+
+            local text = best and best.label
+            if text and type(pagemap.cleanPageLabel) == "function" then
+                text = pagemap:cleanPageLabel(text)
+            end
+            text = text and tostring(text) or fallback
+            cache[page_num] = text
+            return text
+        end
+
+        -- ----------------------------------------------------------------
+        -- 1. Patch init: blank title, X to left, 3 icons on right
+        -- ----------------------------------------------------------------
+        local _orig_init = PageBrowserWidget.init
+        PageBrowserWidget.init = function(self)
+            _orig_init(self)
+            -- Register pan_release so onPanRelease fires when the user lifts
+            -- their finger after dragging the slider.  PageBrowserWidget does
+            -- not include pan_release in its native ges_events.
+            self.ges_events.PanRelease = {
+                GestureRange:new{
+                    ges   = "pan_release",
+                    range = Geom:new{ x = 0, y = 0,
+                                      w = Screen:getWidth(), h = Screen:getHeight() },
+                }
+            }
+            -- Store original grid dimensions so view-toggle buttons can restore them.
+            self._zen_orig_nb_cols = self.nb_cols
+            self._zen_orig_nb_rows = self.nb_rows
+            -- Block slider input until the opening swipe gesture completes so
+            -- the northward swipe that opens us doesn't immediately move the
+            -- slider (which appears right where the finger lifted).
+            self._zen_slider_locked = true
+            UIManager:scheduleIn(0.35, function()
+                self._zen_slider_locked = false
+            end)
+
+            -- Blank the title text (no "Page browser" label)
+            self.title_bar:setTitle("")
+
+            local btn_sz  = Screen:scaleBySize(32)
+            local btn_pad = self.title_bar.button_padding or Screen:scaleBySize(11)
+
+            -- Remove the hamburger (left_button)
+            if self.title_bar.left_button then
+                for i = #self.title_bar, 1, -1 do
+                    if self.title_bar[i] == self.title_bar.left_button then
+                        table.remove(self.title_bar, i)
+                        break
+                    end
+                end
+                self.title_bar.left_button   = nil
+                self.title_bar.has_left_icon = false
+            end
+
+            -- Move the close button (right_button) to the LEFT side.
+            -- Extract the close callback before removing it.
+            local close_cb, close_hold_cb
+            if self.title_bar.right_button then
+                close_cb      = self.title_bar.right_button.callback
+                close_hold_cb = self.title_bar.right_button.hold_callback
+                for i = #self.title_bar, 1, -1 do
+                    if self.title_bar[i] == self.title_bar.right_button then
+                        table.remove(self.title_bar, i)
+                        break
+                    end
+                end
+                self.title_bar.right_button   = nil
+                self.title_bar.has_right_icon = false
+            end
+
+            -- Re-add close at left as a left chevron (overlap_align="left", tap zone extends right)
+            table.insert(self.title_bar, IconButton:new{
+                icon           = "chevron.left",
+                width          = btn_sz,
+                height         = btn_sz,
+                padding        = btn_pad,
+                padding_right  = 2 * btn_sz,
+                padding_bottom = btn_sz,
+                overlap_align  = "left",
+                allow_flash    = false,
+                show_parent    = self,
+                callback       = close_cb or function() self:onClose() end,
+                hold_callback  = close_hold_cb,
+            })
+
+            -- Add 3 icon buttons on the RIGHT side (font, toc, search)
+            local slot_w  = btn_sz + btn_pad * 2
+            local right_x = Screen:getWidth()
+
+            local _toc_icon_path = _icons_dir and utils.resolveIcon(_icons_dir, "toc")
+
+            local function make_right_btn(icon, x_pos, cb, file_path)
+                local cls = file_path and ZenIconButton or IconButton
+                return cls:new{
+                    file           = file_path,
+                    icon           = icon,
+                    width          = btn_sz,
+                    height         = btn_sz,
+                    padding        = btn_pad,
+                    padding_bottom = btn_sz,
+                    overlap_offset = { x_pos, 0 },
+                    overlap_align  = "left",
+                    allow_flash    = true,
+                    show_parent    = self,
+                    callback       = cb or function() end,
+                }
+            end
+
+            -- TOC button opens ZenTocWidget
+            local pbw_ref = self
+            local function open_toc()
+                -- Close the page browser first so the TOC renders over the reader.
+                pbw_ref:onClose()
+                UIManager:show(ZenTocWidget:new{
+                    ui         = pbw_ref.ui,
+                    focus_page = pbw_ref.focus_page or pbw_ref.cur_page or 1,
+                    on_goto    = function(page)
+                        -- Navigate directly in the book (PBW is already closed).
+                        if pbw_ref.ui.link then
+                            pbw_ref.ui.link:addCurrentLocationToStack()
+                        end
+                        pbw_ref.ui:handleEvent(Event:new("GotoPage", page))
+                    end,
+                })
+            end
+            local function open_search()
+                -- Use onClose() (synchronous) so the page browser is removed
+                -- from the widget stack before the search dialog appears,
+                -- matching how open_font_menu closes the PBW.
+                pbw_ref:onClose()
+                pbw_ref.ui:handleEvent(Event:new("ShowFulltextSearchInput"))
+            end
+            local function open_bookmarks()
+                -- Close page browser and open bookmarks list
+                pbw_ref:onClose()
+                if pbw_ref.ui.bookmark then
+                    pbw_ref.ui.bookmark:onShowBookmark()
+                end
+            end
+
+            local function open_reader_menu()
+                local ui_ref = pbw_ref.ui
+                if not (ui_ref and ui_ref.config) then
+                    logger.warn("zen PBW open_reader_menu: ui.config missing")
+                    pbw_ref:onClose()
+                    return
+                end
+                local cfg = ui_ref.config
+                -- Close PBW first so it is off the stack before the dialog appears.
+                pbw_ref:onClose()
+                UIManager:nextTick(function()
+                    if cfg.config_dialog then return end -- already open
+                    local ok, err = pcall(function()
+                        local ConfigDialog = require("ui/widget/configdialog")
+                        -- Forward-declare so the close_callback closure captures it
+                        -- as a proper upvalue (in Lua, local x = expr puts x in
+                        -- scope only AFTER the statement, so the closure would see
+                        -- a global 'dialog' (nil) if we used a single statement).
+                        local dialog
+                        dialog = ConfigDialog:new{
+                            document        = cfg.document,
+                            ui              = cfg.ui,
+                            configurable    = cfg.configurable,
+                            config_options  = cfg.options,
+                            is_always_active = true,
+                            covers_footer   = true,
+                            close_callback  = function()
+                                cfg.last_panel_index = dialog.panel_index or cfg.last_panel_index
+                                cfg.config_dialog = nil
+                                ui_ref:handleEvent(Event:new("RestoreHinting"))
+                            end,
+                        }
+                        cfg.config_dialog = dialog
+                        if ui_ref.keyselection and type(ui_ref.keyselection.onStopHighlightIndicator) == "function" then
+                            ui_ref.keyselection:onStopHighlightIndicator(true)
+                        elseif ui_ref.highlight and type(ui_ref.highlight.onStopHighlightIndicator) == "function" then
+                            ui_ref.highlight:onStopHighlightIndicator(true)
+                        end
+                        ui_ref:handleEvent(Event:new("DisableHinting"))
+                        dialog:onShowConfigPanel(cfg.last_panel_index)
+                        UIManager:show(dialog)
+                    end)
+                    if not ok then
+                        logger.err("zen PBW open_reader_menu: failed to open config dialog:", err)
+                        cfg.config_dialog = nil
+                    end
+                end)
+            end
+
+            -- Vocab Builder: show button only if plugin is active and icon resolves.
+            -- package.loaded["db"] is set when vocabbuilder.koplugin is running
+            -- (same check used by dict_quick_lookup.lua).
+            local _vocab_icon_path = package.loaded["db"]
+                and _icons_dir and utils.resolveIcon(_icons_dir, "tab_vocab")
+
+            local function open_vocab()
+                pbw_ref:onClose()
+                pbw_ref.ui:handleEvent(Event:new("ShowVocabBuilder"))
+            end
+
+            -- Left to right: TOC, [Vocab], Bookmark, Font, Search
+            -- When vocab builder is active, TOC shifts one slot further left.
+            local toc_slot = _vocab_icon_path and 5 or 4
+            table.insert(self.title_bar, make_right_btn("appbar.search",     right_x - slot_w,         open_search))
+            table.insert(self.title_bar, make_right_btn("appbar.textsize",   right_x - slot_w * 2,     open_reader_menu))
+            table.insert(self.title_bar, make_right_btn("bookmark",          right_x - slot_w * 3,     open_bookmarks))
+            if _vocab_icon_path then
+                table.insert(self.title_bar, make_right_btn(nil, right_x - slot_w * 4, open_vocab, _vocab_icon_path))
+            end
+            table.insert(self.title_bar, make_right_btn("appbar.navigation", right_x - slot_w * toc_slot, open_toc, _toc_icon_path))
+
+            -- Restore last-used layout; default to grid so thumbnails are small
+            -- and render quickly on slower devices (e.g. Kindle PW4).
+            -- Single-page mode is only used when the user explicitly chose it.
+            local _saved_layout = get_page_browser_layout()
+            if _saved_layout == "single" then
+                self._zen_nb_cols_override = 1
+                self._zen_nb_rows_override = 1
+            end
+            -- Re-run updateLayout to capture the modified title bar in self[1].
+            -- When no layout override is needed, skip _orig_updateLayout to avoid
+            -- cancelling the async tile rendering queue that it already started.
+            if not self._zen_nb_cols_override then
+                self._zen_panel_only_rebuild = true
+            end
+            self:updateLayout()
+            self._zen_panel_only_rebuild = nil
+        end
+
+        -- ----------------------------------------------------------------
+        -- 2. Patch updateLayout: swap BookMapRow ribbon for ZenSlider+labels
+        -- ----------------------------------------------------------------
+        local _orig_updateLayout = PageBrowserWidget.updateLayout
+
+        -- Pre-measure panel height once so we can inject it as row_height
+        -- before _orig_updateLayout runs. This means the native code computes
+        -- grid_height = screen_h - title_h - panel_h, sizes thumbnails to fit
+        -- that exact space, and positions them with correct offsets. No
+        -- post-hoc shrinking = no thumbnail overlap.
+        local zen_icon_size      = Screen:scaleBySize(24)  -- view-toggle (grid/single) icons
+        local zen_skip_icon_size = Screen:scaleBySize(36)  -- skip-chapter chevron icons
+        local zen_icon_pad_h = Screen:scaleBySize(20)  -- horizontal padding (wider buttons)
+        local zen_icon_pad_v = Screen:scaleBySize(10)  -- vertical padding (taller buttons)
+        local zen_panel_pad_v = Screen:scaleBySize(6)  -- panel vertical padding (between elements)
+        local zen_panel_pad_btn = Screen:scaleBySize(12) -- gap above button group
+        local zen_panel_pad_top = Screen:scaleBySize(6)   -- top padding (label to grid)
+        local zen_panel_pad_bottom = Screen:scaleBySize(12)  -- extra bottom padding
+
+        local function zen_measure_panel_h(nb_pages)
+            local knob_r   = Screen:scaleBySize(16.5)  -- matches ZenSlider default
+            local slider_h = knob_r * 2 + Screen:scaleBySize(6)
+            -- Measure label height from a live TextWidget
+            local tw = TextWidget:new{ text = "Wg",
+                                       face = Font:getFace("cfont", 14),
+                                       padding = 0 }
+            local lh = tw:getSize().h
+            tw:free()
+            -- Button group height: max of view-toggle (with border) and skip buttons (borderless)
+            local btn_toggle_h = zen_icon_size      + zen_icon_pad_v * 2 + Screen:scaleBySize(2) * 2
+            local btn_skip_h   = zen_skip_icon_size + zen_icon_pad_v * 2
+            local btn_h = math.max(btn_toggle_h, btn_skip_h)
+            -- top_pad + panel_pads + 1× label + (optional slider) + 1× icon row + bottom_pad
+            -- Only include slider height and spacing if there's more than 1 page
+            if nb_pages and nb_pages > 1 then
+                return zen_panel_pad_top + zen_panel_pad_v + zen_panel_pad_btn + lh + slider_h + btn_h + zen_panel_pad_bottom
+            else
+                return zen_panel_pad_top + zen_panel_pad_btn + lh + btn_h + zen_panel_pad_bottom
+            end
+        end
+
+        PageBrowserWidget.updateLayout = function(self)
+            -- Free any panel we built in a previous updateLayout call.
+            if self._zen_row_panel then
+                if self._zen_row_panel.free then self._zen_row_panel:free() end
+                self._zen_row_panel = nil
+            end
+
+            -- Inject our required panel height as row_height BEFORE calling
+            -- _orig_updateLayout. The native code uses self.row_height if it
+            -- is already set — but it recomputes it unconditionally, so we
+            -- must monkey-patch span_height temporarily to coerce the result.
+            -- Simpler: just call _orig_updateLayout, then rebuild the grid
+            -- from scratch with the correct height. Instead we use the cleanest
+            -- approach: override nb_toc_spans to 0 via a temporary shim so
+            -- the native row_height formula yields the minimum, then fix up.
+            --
+            -- Actually the cleanest approach: run _orig_updateLayout normally,
+            -- then rebuild self.grid (OverlapGroup) with the corrected height.
+            -- The native code rebuilds self.grid from scratch inside
+            -- _orig_updateLayout, so we just need to redo that part.
+            local zen_panel_h = zen_measure_panel_h(self.nb_pages or 1)
+
+            -- When _zen_panel_only_rebuild is set (second call during init, no
+            -- layout change needed), skip _orig_updateLayout entirely so the
+            -- async tile rendering queue started by the first call is not
+            -- cancelled and restarted, which caused ~11s delays on slow devices.
+            local top_pad = Screen:scaleBySize(6)  -- grid-to-title gap; used below
+            if self._zen_panel_only_rebuild then
+                logger.dbg("ZenUI page_browser: panel-only rebuild, skipping _orig_updateLayout")
+                self._zen_tile_size = nil
+            else
+            local nb_toc_pre
+            if self.ui.handmade and self.ui.handmade:isHandmadeTocEnabled() then
+                nb_toc_pre = self.ui.doc_settings:readSetting("page_browser_toc_depth_handmade_toc") or self.max_toc_depth
+            else
+                nb_toc_pre = self.ui.doc_settings:readSetting("page_browser_toc_depth") or self.max_toc_depth
+            end
+            nb_toc_pre = nb_toc_pre or 0
+            local stats_on = self.ui.statistics and self.ui.statistics:isEnabled()
+            local psr      = (not stats_on and nb_toc_pre > 0) and 0.2 or 1
+            local BookMapRow = require("ui/widget/bookmapwidget").BookMapRow
+            local border2    = 2 * BookMapRow.pages_frame_border
+            local factor     = nb_toc_pre + psr + 1
+            -- Solve: factor * span_height + border2 = zen_panel_h + top_pad
+            local target_span = math.max(1, math.floor((zen_panel_h + top_pad - border2) / factor))
+            local orig_span_h = self.span_height
+            self.span_height  = target_span
+
+            -- _orig_updateLayout UNCONDITIONALLY overwrites self.nb_cols/nb_rows
+            -- by reading from doc_settings (key: "page_browser_nb_cols/rows").
+            -- Temporarily patch those keys so our forced layout survives.
+            local ds = self.ui and self.ui.doc_settings
+            local _saved_ds_cols, _saved_ds_rows, _zen_ds_patched
+            if self._zen_nb_cols_override then
+                local nc = self._zen_nb_cols_override
+                local nr = self._zen_nb_rows_override or nc
+                self._zen_nb_cols_override = nil
+                self._zen_nb_rows_override = nil
+                logger.dbg("ZenUI page_browser: forcing cols="..nc.." rows="..nr)
+                if ds then
+                    _saved_ds_cols = ds:readSetting("page_browser_nb_cols")
+                    _saved_ds_rows = ds:readSetting("page_browser_nb_rows")
+                    logger.dbg("ZenUI page_browser: saved ds cols="..tostring(_saved_ds_cols).." rows="..tostring(_saved_ds_rows))
+                    ds:saveSetting("page_browser_nb_cols", nc)
+                    ds:saveSetting("page_browser_nb_rows", nr)
+                    _zen_ds_patched = true
+                else
+                    -- no doc_settings: set directly (won't be overwritten)
+                    self.nb_cols = nc
+                    self.nb_rows = nr
+                end
+            end
+
+            -- Reset cached tile size; the new layout will re-seed it on
+            -- the first showTile call.
+            self._zen_tile_size = nil
+
+            _orig_updateLayout(self)
+
+            logger.dbg("ZenUI page_browser: after orig nb_cols="..tostring(self.nb_cols).." nb_rows="..tostring(self.nb_rows).." nb_grid_items="..tostring(self.nb_grid_items))
+
+            -- Restore span_height so the detached BookMapRow is self-consistent.
+            self.span_height = orig_span_h
+            -- Restore doc_settings to original values (undo temporary patch).
+            -- If the key didn't exist before, delete it rather than saveSetting(nil).
+            if _zen_ds_patched and ds then
+                if _saved_ds_cols ~= nil then
+                    ds:saveSetting("page_browser_nb_cols", _saved_ds_cols)
+                else
+                    ds:delSetting("page_browser_nb_cols")
+                end
+                if _saved_ds_rows ~= nil then
+                    ds:saveSetting("page_browser_nb_rows", _saved_ds_rows)
+                else
+                    ds:delSetting("page_browser_nb_rows")
+                end
+                logger.dbg("ZenUI page_browser: restored ds cols="..tostring(_saved_ds_cols).." rows="..tostring(_saved_ds_rows))
+            end
+            end -- panel_only_rebuild else
+
+            -- Suppress native left-side page number widgets: we draw our own
+            -- badges in paintTo() instead.  showTile() checks show_pagenum on
+            -- the FrameContainer before inserting a TextBoxWidget; clearing it
+            -- here stops future insertions.  Then remove any already inserted
+            -- during the update() call that _orig_updateLayout makes internally.
+            for i = 1, (self.nb_grid_items or 0) do
+                if self.grid[i] then
+                    self.grid[i].show_pagenum = false
+                end
+            end
+            for i = #self.grid, 1, -1 do
+                if self.grid[i] and self.grid[i].is_page_num_widget then
+                    if self.grid[i].free then self.grid[i]:free() end
+                    table.remove(self.grid, i)
+                end
+            end
+
+            -- After _orig_updateLayout:
+            --  self.row_height  ≈ zen_panel_h + top_pad
+            --  self.grid_height  = screen_h - title_h - zen_panel_h - top_pad
+            --  self.grid         = OverlapGroup sized to grid_height (correct)
+            --  self.row          = CenterContainer (kept detached)
+
+            -- Cache the grid screen region for targeted dirty calls while
+            -- scrubbing.  Expand by Size.border.thin on the top edge so that
+            -- the first row's border overflow is included in every screen flush.
+            local _gd_bs = Size.border.thin
+            local _scrub_top = math.max(0, self.dimen.y + (self.title_bar_h or 0) + top_pad - _gd_bs)
+            self._zen_grid_dimen = Geom:new{
+                x = self.dimen.x,
+                y = _scrub_top,
+                w = self.grid_width or self.dimen.w,
+                h = (self.grid_height or 0) + _gd_bs,
+            }
+            -- Combined region covering grid + panel (including the slider).
+            -- Using one dirty call with the correct waveform is crucial: the
+            -- "fast" (A2) waveform is black/white-only and corrupts the gray
+            -- badge backgrounds; "ui" (GL16) handles gray correctly.
+            self._zen_scrub_dimen = Geom:new{
+                x = self.dimen.x,
+                y = _scrub_top,
+                w = self.dimen.w,
+                h = self.dimen.h + self.dimen.y - _scrub_top,
+            }
+
+            local nb_pages  = self.nb_pages  or 1
+            local cur_page  = self.focus_page or self.cur_page or 1
+            local grid_w    = self.grid_width or Screen:getWidth()
+
+            -- Derive the thumbnail-span width from the actual layout, then use
+            -- roughly half of that for the slider so it sits as a short centred
+            -- track rather than spanning edge-to-edge.
+            local outer_margin = (self.grid[1] and self.grid[1].overlap_offset
+                                  and self.grid[1].overlap_offset[1]) or 0
+            local thumb_span = math.max(1, grid_w - 2 * outer_margin)
+            local slider_w   = math.floor(thumb_span * 0.95)
+
+            local function chapter_title(pg)
+                if not self.ui or not self.ui.toc then return "" end
+                return self.ui.toc:getTocTitleByPage(pg) or ""
+            end
+
+            local label_face = Font:getFace("cfont", 18)
+            local pad_v      = zen_panel_pad_v
+
+            -- Use focus_page consistently so slider position doesn't jump when switching views
+            local cp = self.focus_page or cur_page
+            local chap_label = TextWidget:new{
+                text      = chapter_title(cp),
+                face      = label_face,
+                max_width = slider_w,
+                padding   = 0,
+            }
+
+            -- Throttle interval for setDirty during drag (seconds).
+            -- GL16 takes ~450ms on Kobo; firing faster than this just queues
+            -- competing waveform cycles that produce artifacts.
+            -- Deferred full update used to debounce thumbnail re-render during drag.
+            -- Fires after 250 ms of slider inactivity regardless of whether the
+            -- finger is still down; if the user resumes dragging, on_change will
+            -- re-enable scrubbing and reschedule.
+            self._zen_deferred_update = function()
+                logger.dbg("ZenUI PBW deferred_update: fired, setting post_scrub=true")
+                self._zen_scrubbing = false
+                self._zen_placeholders_painted = false
+                self._zen_last_scrub_dirty = nil
+                self._zen_post_scrub = true
+                UIManager:unschedule(self._zen_post_scrub_clear)
+                UIManager:scheduleIn(0.4, self._zen_post_scrub_clear)
+                self:update()
+            end
+
+            -- Clears post-scrub suppression and fires one clean repaint to show
+            -- all tiles that loaded during the suppression window without flashing.
+            self._zen_post_scrub_clear = function()
+                logger.dbg("ZenUI PBW post_scrub_clear: fired, clearing post_scrub, scheduling setDirty")
+                self._zen_post_scrub = false
+                UIManager:setDirty(self, "ui", self._zen_scrub_dimen or self.dimen)
+            end
+
+            -- Paint the slider (and optionally chapter label) directly to
+            -- Screen.bb, bypassing the widget tree.  Then queue an
+            -- A2-waveform hardware refresh of just the slider area via
+            -- setDirty(nil, ...) — nil means "don't repaint any widgets."
+            -- A2 completes in ~60ms so frames can't pile up.
+            local function directPaintSlider(sl, label, label_text)
+                if not sl or not sl.dimen or not sl.dimen.x then return end
+                sl:paintTo(Screen.bb, sl.dimen.x, sl.dimen.y)
+                if label and label_text then
+                    -- TextWidget doesn't set self.dimen in paintTo, so we
+                    -- compute label position from the slider (which does).
+                    -- Layout order: chapter label → pad_v → slider.
+                    local lh = label:getSize().h
+                    local label_y = sl.dimen.y - pad_v - lh
+                    -- Erase the full slider_w row, then paint centred text.
+                    Screen.bb:paintRect(sl.dimen.x, label_y, slider_w, lh,
+                                        Blitbuffer.COLOR_WHITE)
+                    label:setText(label_text)
+                    local new_w = label:getSize().w
+                    local label_x = sl.dimen.x + math.floor((slider_w - new_w) / 2)
+                    label:paintTo(Screen.bb, label_x, label_y)
+                end
+                -- No A2 here — the caller pushes one consolidated refresh.
+            end
+
+            -- Paint blank placeholders with page-number badges directly to
+            -- Screen.bb for all grid cells, then push one A2 refresh over
+            -- the combined grid + slider region.
+            --
+            -- On the FIRST call after scrubbing starts, erase thumbnails and
+            -- draw the static borders (they never move).  On subsequent calls,
+            -- only erase + repaint the small badge area at the bottom of each
+            -- cell — the borders stay untouched in the framebuffer.
+            local badge_face_s = Font:getFace("cfont", 13)
+            local ph_s         = Screen:scaleBySize(4)
+            local pv_s         = Screen:scaleBySize(2)
+            -- Pure B/W so A2 waveform renders the badge cleanly (same as chapter text).
+            local bg_color_s   = Blitbuffer.COLOR_BLACK
+            local fg_color_s   = Blitbuffer.COLOR_WHITE
+            local gap_bot_s    = Screen:scaleBySize(3)
+            local bs_s         = Size.border.thin
+
+            -- Pre-measure the maximum badge height (constant for all cells).
+            local _badge_h_sample = TextWidget:new{
+                text = "0", face = badge_face_s, padding = 0,
+            }
+            local badge_max_h = _badge_h_sample:getSize().h + 2 * pv_s
+            _badge_h_sample:free()
+
+            local function directPaintScrub(focus_pg, chap_text)
+                local pbw  = self
+                local bb   = Screen.bb
+                local sl   = pbw._zen_slider
+                local clbl = pbw._zen_chap_label
+                local grid = pbw.grid
+                if not grid then return end
+
+                local fp    = focus_pg or pbw.focus_page or 1
+                local shift = pbw.focus_page_shift or 0
+                local np    = pbw.nb_pages or 1
+                local n     = pbw.nb_grid_items or 0
+
+                -- Grid top-left in blitbuffer space
+                local title_h = (pbw.title_bar and pbw.title_bar:getSize().h) or 0
+                local gx = pbw.dimen.x or 0
+                local gy = (pbw.dimen.y or 0) + title_h + Screen:scaleBySize(6)
+
+                local first_frame = not pbw._zen_placeholders_painted
+
+                for i = 1, n do
+                    local item = grid[i]
+                    if item and item.overlap_offset then
+                        local page_num = fp - shift + (i - 1)
+                        local ox = item.overlap_offset[1]
+                        local oy = item.overlap_offset[2]
+                        local sz = item:getSize()
+
+                        if first_frame then
+                            -- Erase cell + draw static border (once)
+                            bb:paintRect(gx + ox - bs_s, gy + oy - bs_s,
+                                         sz.w + 2 * bs_s, sz.h + 2 * bs_s,
+                                         Blitbuffer.COLOR_WHITE)
+                            local tw = (pbw._zen_tile_size and pbw._zen_tile_size.w) or sz.w
+                            local th = (pbw._zen_tile_size and pbw._zen_tile_size.h) or sz.h
+                            local pdx = math.floor((sz.w - tw) / 2)
+                            local pdy = math.floor((sz.h - th) / 2)
+                            bb:paintBorder(gx + ox + pdx - bs_s, gy + oy + pdy - bs_s,
+                                           tw + 2 * bs_s, th + 2 * bs_s,
+                                           bs_s, Blitbuffer.COLOR_BLACK, 0)
+                        end
+
+                        -- Badge area: erase + repaint (every frame)
+                        -- Clip to the interior of the border so we never
+                        -- overwrite the bottom line or corner pixels.
+                        local tw = (pbw._zen_tile_size and pbw._zen_tile_size.w) or sz.w
+                        local th = (pbw._zen_tile_size and pbw._zen_tile_size.h) or sz.h
+                        local pdx = math.floor((sz.w - tw) / 2)
+                        local pdy = math.floor((sz.h - th) / 2)
+                        local inner_x = gx + ox + pdx
+                        local inner_bottom = gy + oy + pdy + th
+                        local badge_y = gy + oy + sz.h - badge_max_h - gap_bot_s
+                        local erase_h = math.max(0, inner_bottom - badge_y)
+                        if erase_h > 0 then
+                            bb:paintRect(inner_x, badge_y, tw, erase_h,
+                                     Blitbuffer.COLOR_WHITE)
+                        end
+
+                        if page_num >= 1 and page_num <= np then
+                            local lbl = TextWidget:new{
+                                text    = get_page_display_text(pbw, page_num),
+                                face    = badge_face_s,
+                                fgcolor = fg_color_s,
+                                padding = 0,
+                            }
+                            local lsz = lbl:getSize()
+                            local bh  = lsz.h + 2 * pv_s
+                            local bw  = math.max(lsz.w + 2 * ph_s, bh)
+                            local bx  = gx + ox + math.floor((sz.w - bw) / 2)
+                            local by  = gy + oy + sz.h - bh - gap_bot_s
+
+                            local r_p = bh / 2
+                            for row = 0, bh - 1 do
+                                local dy = math.abs(row + 0.5 - r_p)
+                                local dx = math.sqrt(math.max(0, r_p * r_p - dy * dy))
+                                local x0 = math.ceil(bx + r_p - dx)
+                                local x1 = math.floor(bx + bw - r_p + dx)
+                                local w  = x1 - x0
+                                if w > 0 then bb:paintRect(x0, by + row, w, 1, bg_color_s) end
+                            end
+
+                            lbl:paintTo(bb,
+                                bx + math.floor((bw - lsz.w) / 2),
+                                by + math.floor((bh - lsz.h) / 2))
+                            lbl:free()
+                        end
+                    end
+                end
+
+                pbw._zen_placeholders_painted = true
+
+                -- Paint slider + chapter label
+                directPaintSlider(sl, clbl, chap_text)
+
+                -- Single A2 refresh covering grid + label + slider
+                -- (buttons are excluded via the tightened scrub_dimen).
+                -- One call avoids the double-flash that two separate A2
+                -- regions produce on e-ink, especially in single-page mode.
+                UIManager:setDirty(nil, "fast", pbw._zen_scrub_dimen or pbw.dimen)
+            end
+
+            -- Deferred scrub dirty: fires the throttled setDirty at the end
+            -- of the throttle window so the most recent state is displayed.
+            self._zen_scrub_dirty_func = function()
+                if not self._zen_scrubbing then return end
+                self._zen_last_scrub_dirty = os.clock()
+                directPaintScrub(self.focus_page or self.cur_page or 1,
+                    chapter_title(self.focus_page or self.cur_page or 1))
+            end
+
+            -- Only create slider if there's more than 1 page
+            local zen_slider
+            if nb_pages > 1 then
+                zen_slider = ZenSlider:new{
+                    width       = slider_w,
+                    value       = cp,
+                    value_min   = 1,
+                    value_max   = math.max(nb_pages, 1),
+                    on_change   = function(v)
+                        -- Set scrubbing BEFORE updateFocusPage so that any
+                        -- showTile callbacks it triggers are already suppressed,
+                        -- preventing a flash of stale tile bitmaps on drag start.
+                        local dragging = self._zen_slider and self._zen_slider._dragging
+                        if dragging then
+                            self._zen_scrubbing = true
+                            -- Cancel any pending post-scrub clear so resuming a
+                            -- drag after a pause doesn't re-enable tile refreshes.
+                            UIManager:unschedule(self._zen_post_scrub_clear)
+                        end
+                        if self:updateFocusPage(v, false) then
+                            if dragging then
+                                UIManager:unschedule(self._zen_deferred_update)
+                                UIManager:scheduleIn(0.25, self._zen_deferred_update)
+                                -- Paint grid placeholders + slider + label
+                                -- directly to Screen.bb and push one A2 refresh.
+                                directPaintScrub(v, chapter_title(v))
+                            else
+                                UIManager:unschedule(self._zen_deferred_update)
+                                UIManager:unschedule(self._zen_scrub_dirty_func)
+                                self._zen_scrubbing = false
+                                self._zen_placeholders_painted = false
+                                self._zen_last_scrub_dirty = nil
+                                self._zen_post_scrub = true
+                                UIManager:unschedule(self._zen_post_scrub_clear)
+                                UIManager:scheduleIn(0.4, self._zen_post_scrub_clear)
+                                self:update()
+                            end
+                        end
+                    end,
+                }
+            end
+
+            self._zen_slider     = zen_slider
+            self._zen_chap_label = chap_label
+
+            -- View-mode toggle buttons: single page / grid.
+            -- Create a unified button group with divider and active state styling.
+            local pbw = self
+
+            -- Determine current layout mode
+            local is_single_page = (self.nb_cols == 1 and self.nb_rows == 1)
+
+            local grid_slide_path = _icons_dir and utils.resolveIcon(_icons_dir, "grid_slide")
+            local grid_path       = _icons_dir and utils.resolveIcon(_icons_dir, "grid")
+            local skip_left_path  = _icons_dir and utils.resolveIcon(_icons_dir, "skip_left")
+            local skip_right_path = _icons_dir and utils.resolveIcon(_icons_dir, "skip_right")
+
+            -- Create icon widgets with active state styling
+            local icon_size      = zen_icon_size
+            local skip_icon_size = zen_skip_icon_size
+            local icon_pad_h = zen_icon_pad_h
+            local icon_pad_v = zen_icon_pad_v
+
+            local icon_view = IconWidget:new{
+                file   = grid_slide_path,
+                icon   = grid_slide_path and nil or "grid_slide",
+                width  = icon_size,
+                height = icon_size,
+                alpha  = not is_single_page, -- opaque when active, alpha when inactive
+            }
+
+            local icon_grid = IconWidget:new{
+                file   = grid_path,
+                icon   = grid_path and nil or "grid",
+                width  = icon_size,
+                height = icon_size,
+                alpha  = is_single_page, -- opaque when active, alpha when inactive
+            }
+
+            -- Invert the active icon (white icon on black bg)
+            if is_single_page then
+                icon_view:_render()
+                if icon_view._bb then
+                    local bb_copy = icon_view._bb:copy()
+                    bb_copy:invertRect(0, 0, bb_copy:getWidth(), bb_copy:getHeight())
+                    icon_view._bb = bb_copy
+                end
+            else
+                icon_grid:_render()
+                if icon_grid._bb then
+                    local bb_copy = icon_grid._bb:copy()
+                    bb_copy:invertRect(0, 0, bb_copy:getWidth(), bb_copy:getHeight())
+                    icon_grid._bb = bb_copy
+                end
+            end
+
+            -- Wrap icons in fixed-width containers to ensure perfect centering
+            local CenterContainer_ic = require("ui/widget/container/centercontainer")
+            local icon_view_centered = CenterContainer_ic:new{
+                dimen = Geom:new{ w = icon_size, h = icon_size },
+                icon_view,
+            }
+            local icon_grid_centered = CenterContainer_ic:new{
+                dimen = Geom:new{ w = icon_size, h = icon_size },
+                icon_grid,
+            }
+
+            -- Container for left button (single page view) - no rounded inner corners
+            local btn_view_frame = FrameContainer:new{
+                padding_top    = icon_pad_v,
+                padding_bottom = icon_pad_v,
+                padding_left   = icon_pad_h,
+                padding_right  = icon_pad_h,
+                bordersize     = 0,
+                background     = is_single_page and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+                icon_view_centered,
+            }
+
+            -- Container for right button (grid view) - no rounded inner corners
+            local btn_grid_frame = FrameContainer:new{
+                padding_top    = icon_pad_v,
+                padding_bottom = icon_pad_v,
+                padding_left   = icon_pad_h,
+                padding_right  = icon_pad_h,
+                bordersize     = 0,
+                background     = is_single_page and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
+                icon_grid_centered,
+            }
+
+            -- Vertical divider
+            local LineWidget = require("ui/widget/linewidget")
+            local divider = LineWidget:new{
+                dimen          = Geom:new{
+                    w = Screen:scaleBySize(1),
+                    h = icon_size + icon_pad_v * 2,
+                },
+                background     = Blitbuffer.COLOR_DARK_GRAY,
+                direction      = "vert",
+            }
+
+            -- Unified button group
+            local btn_group = HorizontalGroup:new{
+                align = "center",
+                btn_view_frame,
+                divider,
+                btn_grid_frame,
+            }
+
+            -- Wrap in frame with border and rounded corners
+            local btn_row = FrameContainer:new{
+                padding        = 0,
+                margin         = 0,
+                bordersize     = Screen:scaleBySize(2),
+                background     = Blitbuffer.COLOR_WHITE,
+                radius         = Screen:scaleBySize(4),
+                btn_group,
+            }
+
+            -- Skip chapter buttons (larger icons, no border)
+            local function make_skip_btn(file_path, fallback_icon)
+                return FrameContainer:new{
+                    padding_top    = icon_pad_v,
+                    padding_bottom = icon_pad_v,
+                    padding_left   = icon_pad_h,
+                    padding_right  = icon_pad_h,
+                    bordersize     = 0,
+                    background     = Blitbuffer.COLOR_WHITE,
+                    IconWidget:new{
+                        file   = file_path,
+                        icon   = file_path and nil or fallback_icon,
+                        width  = skip_icon_size,
+                        height = skip_icon_size,
+                    },
+                }
+            end
+            local skip_left_btn  = make_skip_btn(skip_left_path,  "chevron.left")
+            local skip_right_btn = make_skip_btn(skip_right_path, "chevron.right")
+
+            -- Switch callbacks
+            local _switch_single = function()
+                pbw._zen_nb_cols_override = 1
+                pbw._zen_nb_rows_override = 1
+                set_page_browser_layout("single")
+                logger.dbg("ZenUI page_browser: switch to single page")
+                pbw:updateLayout()
+                UIManager:setDirty(pbw, function() return "partial", pbw.dimen end)
+            end
+            local _switch_grid = function()
+                pbw._zen_nb_cols_override = pbw._zen_orig_nb_cols or 3
+                pbw._zen_nb_rows_override = pbw._zen_orig_nb_rows or 5
+                set_page_browser_layout("grid")
+                logger.dbg("ZenUI page_browser: switch to grid")
+                pbw:updateLayout()
+                UIManager:setDirty(pbw, function() return "partial", pbw.dimen end)
+            end
+            self._zen_switch_single = _switch_single
+            self._zen_switch_grid   = _switch_grid
+
+            -- Chapter-skip: jump to nearest TOC boundary before/after focus_page
+            local function skip_to_prev_chapter()
+                if not pbw.ui or not pbw.ui.toc or not pbw.ui.toc.toc then return end
+                local cur = pbw.focus_page or pbw.cur_page or 1
+                for i = #pbw.ui.toc.toc, 1, -1 do
+                    local e = pbw.ui.toc.toc[i]
+                    if e.page and e.page < cur then
+                        if pbw:updateFocusPage(e.page, false) then pbw:update() end
+                        return
+                    end
+                end
+            end
+            local function skip_to_next_chapter()
+                if not pbw.ui or not pbw.ui.toc or not pbw.ui.toc.toc then return end
+                local cur = pbw.focus_page or pbw.cur_page or 1
+                for _i, e in ipairs(pbw.ui.toc.toc) do
+                    if e.page and e.page > cur then
+                        if pbw:updateFocusPage(e.page, false) then pbw:update() end
+                        return
+                    end
+                end
+            end
+            self._zen_skip_prev = skip_to_prev_chapter
+            self._zen_skip_next = skip_to_next_chapter
+
+            -- Store button group reference for tap handling
+            self._zen_btn_group = btn_row
+            self._zen_btn_view_frame = btn_view_frame
+            self._zen_btn_grid_frame = btn_grid_frame
+
+            -- Compute hit zones analytically from known panel layout.
+            -- The button group is a unified widget, split into left/right tap zones.
+            -- Panel top Y (screen-absolute):
+            local panel_abs_y = (self.dimen.y or 0) + self.dimen.h - zen_panel_h
+            -- Stack the VerticalGroup rows to find btn_row top:
+            local btn_zone_y = panel_abs_y
+                + zen_panel_pad_top
+                + chap_label:getSize().h
+
+            -- Only add slider height if slider exists
+            if zen_slider then
+                btn_zone_y = btn_zone_y + pad_v + zen_slider:getSize().h + zen_panel_pad_btn
+            else
+                btn_zone_y = btn_zone_y + zen_panel_pad_btn
+            end
+
+            -- btn_row is CenterContainer'd horizontally in grid_w
+            local btn_row_sz = btn_row:getSize()
+            local btn_row_w = btn_row_sz.w
+            local btn_row_h = btn_row_sz.h
+            local btn_origin_x = (self.dimen.x or 0) + math.floor((grid_w - btn_row_w) / 2)
+
+            -- Split button group into left (view) and right (grid) hit zones
+            local half_w = math.floor(btn_row_w / 2)
+
+            self._zen_btn_view_zone = Geom:new{
+                x = btn_origin_x,
+                y = btn_zone_y,
+                w = half_w,
+                h = btn_row_h,
+            }
+            self._zen_btn_grid_zone = Geom:new{
+                x = btn_origin_x + half_w,
+                y = btn_zone_y,
+                w = btn_row_w - half_w,
+                h = btn_row_h,
+            }
+            logger.dbg("ZenUI page_browser: btn_view_zone x="..self._zen_btn_view_zone.x.." y="..self._zen_btn_view_zone.y.." w="..self._zen_btn_view_zone.w.." h="..self._zen_btn_view_zone.h)
+            logger.dbg("ZenUI page_browser: btn_grid_zone x="..self._zen_btn_grid_zone.x.." y="..self._zen_btn_grid_zone.y.." w="..self._zen_btn_grid_zone.w.." h="..self._zen_btn_grid_zone.h)
+
+            -- Skip buttons flanking the view-toggle group
+            local skip_side_gap = Screen:scaleBySize(40)
+            local skip_btn_sz   = skip_left_btn:getSize()
+            local skip_btn_w    = skip_btn_sz.w
+            local skip_btn_h    = skip_btn_sz.h
+            local row_h         = math.max(btn_row_h, skip_btn_h)
+            local vert_off_skip = math.floor((row_h - skip_btn_h) / 2)
+
+            skip_left_btn.overlap_offset  = { skip_side_gap, vert_off_skip }
+            skip_right_btn.overlap_offset = { grid_w - skip_side_gap - skip_btn_w, vert_off_skip }
+
+            local btn_and_skip = OverlapGroup:new{
+                dimen           = Geom:new{ w = grid_w, h = row_h },
+                allow_mirroring = false,
+                CenterContainer:new{
+                    dimen = Geom:new{ w = grid_w, h = row_h },
+                    btn_row,
+                },
+                skip_left_btn,
+                skip_right_btn,
+            }
+
+            self._zen_btn_skip_left_zone = Geom:new{
+                x = (self.dimen.x or 0) + skip_side_gap,
+                y = btn_zone_y + vert_off_skip,
+                w = skip_btn_w,
+                h = skip_btn_h,
+            }
+            self._zen_btn_skip_right_zone = Geom:new{
+                x = (self.dimen.x or 0) + grid_w - skip_side_gap - skip_btn_w,
+                y = btn_zone_y + vert_off_skip,
+                w = skip_btn_w,
+                h = skip_btn_h,
+            }
+
+            -- Store panel height for onHold suppression.
+            self._zen_panel_h = zen_panel_h
+
+            -- Tighten the scrub dirty region so that the button row below
+            -- the slider is never included in the A2/GL16 refresh during
+            -- drag.  btn_zone_y is the top of the button group.
+            self._zen_scrub_dimen.h = math.max(1, btn_zone_y - self._zen_scrub_dimen.y)
+
+            -- Panel spans full grid width, pinned to the absolute bottom of
+            -- the screen via OverlapGroup offset (set below).  Height is the
+            -- measured content height, not the (larger) native row_height.
+
+            -- Build panel content dynamically based on whether slider should be shown
+            local panel_content = {
+                align = "center",
+                VerticalSpan:new{ width = zen_panel_pad_top },
+                CenterContainer:new{
+                    dimen = Geom:new{ w = grid_w, h = chap_label:getSize().h },
+                    chap_label,
+                },
+            }
+
+            -- Only add slider and its spacing if there's more than 1 page
+            if zen_slider then
+                table.insert(panel_content, VerticalSpan:new{ width = pad_v })
+                table.insert(panel_content, CenterContainer:new{
+                    dimen = Geom:new{ w = grid_w, h = zen_slider:getSize().h },
+                    zen_slider,
+                })
+            end
+
+            -- Add button group with skip buttons flanking it
+            table.insert(panel_content, VerticalSpan:new{ width = zen_panel_pad_btn })
+            table.insert(panel_content, btn_and_skip)
+            table.insert(panel_content, VerticalSpan:new{ width = zen_panel_pad_bottom })
+
+            local panel = FrameContainer:new{
+                width      = grid_w,
+                height     = zen_panel_h,
+                padding    = 0,
+                margin     = 0,
+                bordersize = 0,
+                background = Blitbuffer.COLOR_WHITE,
+                VerticalGroup:new(panel_content),
+            }
+            -- Pin panel to absolute screen bottom; grid gets the full space above.
+            panel.overlap_offset = { 0, self.dimen.h - zen_panel_h }
+            self._zen_row_panel = panel
+
+            -- Use an OverlapGroup so the panel hovers over the bottom of the
+            -- screen independently of the grid's natural height.  The
+            -- VerticalGroup (title + small gap + grid) occupies the upper
+            -- portion; the panel is drawn over the dead space below the grid.
+            self[1] = FrameContainer:new{
+                width      = self.dimen.w,
+                height     = self.dimen.h,
+                padding    = 0,
+                margin     = 0,
+                bordersize = 0,
+                background = Blitbuffer.COLOR_WHITE,
+                OverlapGroup:new{
+                    dimen = Geom:new{ w = self.dimen.w, h = self.dimen.h },
+                    VerticalGroup:new{
+                        align = "center",
+                        self.title_bar,
+                        VerticalSpan:new{ width = top_pad },
+                        self.grid,
+                    },
+                    panel,
+                }
+            }
+        end
+
+        -- ----------------------------------------------------------------
+        -- 3. Update slider/labels whenever the focus page changes
+        -- ----------------------------------------------------------------
+        local _orig_update = PageBrowserWidget.update
+        PageBrowserWidget.update = function(self)
+            logger.dbg("ZenUI PBW update: focus_page="..tostring(self.focus_page)
+                .." cur_page="..tostring(self.cur_page)
+                .." scrubbing="..tostring(self._zen_scrubbing)
+                .." post_scrub="..tostring(self._zen_post_scrub)
+                .." nb_grid_items="..tostring(self.nb_grid_items)
+                .." nb_pages="..tostring(self.nb_pages))
+            -- On the very first call (focus_page is nil, init → updateLayout → update),
+            -- pre-initialise focus_page from cur_page with clamping so the grid
+            -- never displays blank leading/trailing slots.  Subsequent calls
+            -- (slider drag, scroll) already carry a valid focus_page and don't
+            -- need adjustment.
+            local shift = self.focus_page_shift
+            local items = self.nb_grid_items
+            local total = self.nb_pages
+            if not self.focus_page and shift and items and total and total >= items then
+                local fp     = self.cur_page or 1
+                local min_fp = shift + 1
+                local max_fp = math.max(min_fp, total - items + 1 + shift)
+                self.focus_page = math.max(min_fp, math.min(max_fp, fp))
+                logger.dbg("ZenUI PBW update: clamped focus_page to "..tostring(self.focus_page))
+            end
+
+            -- Block showTile() from re-adding native page number widgets.
+            for i = 1, (self.nb_grid_items or 0) do
+                if self.grid[i] then self.grid[i].show_pagenum = false end
+            end
+
+            -- _orig_update writes BookMapRow into self.row (detached CenterContainer)
+            local t0 = os.clock()
+            _orig_update(self)
+            self._zen_page_label_text_cache = nil
+            self._zen_page_label_source = nil
+            logger.dbg("ZenUI PBW update: _orig_update took "..(os.clock()-t0).."s")
+
+            -- Clean up any page num widgets that slipped through (e.g. async tiles).
+            for i = #self.grid, 1, -1 do
+                if self.grid[i] and self.grid[i].is_page_num_widget then
+                    if self.grid[i].free then self.grid[i]:free() end
+                    table.remove(self.grid, i)
+                end
+            end
+
+            -- Display info for the focus page.
+            local fp    = self.focus_page or self.cur_page or 1
+            local np    = self.nb_pages or 1
+            local cp    = math.max(1, math.min(np, fp))
+
+            if self._zen_slider then
+                self._zen_slider:setValue(cp)
+            end
+            if self._zen_chap_label then
+                local title = ""
+                if self.ui and self.ui.toc then
+                    title = self.ui.toc:getTocTitleByPage(cp) or ""
+                end
+                self._zen_chap_label:setText(title)
+            end
+        end
+
+        -- ----------------------------------------------------------------
+        -- 3a. showTile: cache actual tile pixel dimensions so scrubbing
+        --     placeholders can draw borders at the correct centred position.
+        -- ----------------------------------------------------------------
+        local _orig_showTile = PageBrowserWidget.showTile
+        PageBrowserWidget.showTile = function(self, grid_idx, page, tile, do_refresh)
+            local has_bitmap = tile and tile.bb ~= nil
+            if tile and tile.bb and not self._zen_tile_size then
+                self._zen_tile_size = {
+                    w = tile.bb:getWidth(),
+                    h = tile.bb:getHeight(),
+                }
+                logger.dbg("ZenUI PBW showTile: first tile bitmap seen, size "
+                    ..self._zen_tile_size.w.."x"..self._zen_tile_size.h)
+            end
+            -- During scrubbing and for one full repaint cycle after scrubbing
+            -- ends, suppress per-tile display refreshes.  Without this, each
+            -- async tile that loads fires its own hardware update, producing
+            -- the multi-flash artifact on the panel area.
+            -- _zen_post_scrub is cleared by the next paintTo call.
+            local suppressed = (self._zen_scrubbing or self._zen_post_scrub) and do_refresh
+            logger.dbg("ZenUI PBW showTile: idx="..tostring(grid_idx)
+                .." page="..tostring(page)
+                .." has_bitmap="..tostring(has_bitmap)
+                .." do_refresh="..tostring(do_refresh)
+                .." suppressed="..tostring(suppressed ~= nil and suppressed ~= false)
+                .." scrubbing="..tostring(self._zen_scrubbing)
+                .." post_scrub="..tostring(self._zen_post_scrub))
+            if suppressed then
+                return _orig_showTile(self, grid_idx, page, tile, false)
+            end
+            return _orig_showTile(self, grid_idx, page, tile, do_refresh)
+        end
+
+        -- ----------------------------------------------------------------
+        -- 4. paintTo: suppress the viewfinder overlay; page-number badges
+        -- ----------------------------------------------------------------
+        PageBrowserWidget.paintTo = function(self, bb, x, y)
+            local InputContainer = require("ui/widget/container/inputcontainer")
+            InputContainer.paintTo(self, bb, x, y)
+            -- viewfinder border and row-lines intentionally omitted
+
+            if not (self.grid and self.focus_page) then return end
+
+            local fp    = self.focus_page
+            local shift = self.focus_page_shift or 0
+            local np    = self.nb_pages or 1
+
+            -- Grid top-left in blitbuffer coordinate space.
+            -- OverlapGroup child 1 = VerticalGroup: title_bar → span(top_pad) → grid.
+            local title_h = (self.title_bar and self.title_bar:getSize().h) or 0
+            local gx      = x
+            local gy      = y + title_h + Screen:scaleBySize(6) -- top_pad
+
+            local badge_face = Font:getFace("cfont", 13)
+            local ph         = Screen:scaleBySize(4)   -- badge horiz padding
+            local pv         = Screen:scaleBySize(2)   -- badge vert  padding
+            local bg_color   = Blitbuffer.gray(0x33)   -- dark badge fill
+            local fg_color   = Blitbuffer.gray(0xFF)   -- white badge text
+            local gap_bot    = Screen:scaleBySize(3)   -- badge offset from thumb bottom
+
+            -- paintPill: horizontal capsule (rounded left/right, flat top/bottom).
+            -- Ported from browser_page_count.lua.
+            local function paintPill(bx, by, bw, bh, color)
+                local r = bh / 2
+                for row = 0, bh - 1 do
+                    local dy = math.abs(row + 0.5 - r)
+                    local dx = math.sqrt(math.max(0, r * r - dy * dy))
+                    local x0 = math.ceil(bx + r - dx)
+                    local x1 = math.floor(bx + bw - r + dx)
+                    local w  = x1 - x0
+                    if w > 0 then bb:paintRect(x0, by + row, w, 1, color) end
+                end
+            end
+
+            -- Only iterate the real thumbnail slots (1..nb_grid_items).
+            local n = self.nb_grid_items or 0
+            for i = 1, n do
+                local item = self.grid[i]
+                if item and item.overlap_offset then
+                    local page_num = fp - shift + (i - 1)
+                    if page_num >= 1 and page_num <= np then
+                        local ox = item.overlap_offset[1]
+                        local oy = item.overlap_offset[2]
+                        local sz = item:getSize()
+
+                        -- While scrubbing: blank the cell then draw a bordered
+                        -- placeholder sized to match the actual thumbnail.
+                        if self._zen_scrubbing then
+                            local bs = Size.border.thin
+                            -- Erase full cell + overflow so stale thumbnail +
+                            -- its border are completely hidden.
+                            bb:paintRect(gx + ox - bs, gy + oy - bs,
+                                         sz.w + 2 * bs, sz.h + 2 * bs,
+                                         Blitbuffer.COLOR_WHITE)
+                            -- Border sized to the cached tile pixel dimensions,
+                            -- centred in the cell exactly as CenterContainer would.
+                            -- Falls back to full cell until the first tile is seen.
+                            local tw = (self._zen_tile_size and self._zen_tile_size.w) or sz.w
+                            local th = (self._zen_tile_size and self._zen_tile_size.h) or sz.h
+                            local pdx = math.floor((sz.w - tw) / 2)
+                            local pdy = math.floor((sz.h - th) / 2)
+                            bb:paintBorder(gx + ox + pdx - bs, gy + oy + pdy - bs,
+                                           tw + 2 * bs, th + 2 * bs,
+                                           bs, Blitbuffer.COLOR_BLACK, 0)
+                        end
+
+                        local label = TextWidget:new{
+                            text    = get_page_display_text(self, page_num),
+                            face    = badge_face,
+                            fgcolor = fg_color,
+                            padding = 0,
+                        }
+                        local lsz = label:getSize()
+                        local bh  = lsz.h + 2 * pv
+                        local bw  = math.max(lsz.w + 2 * ph, bh)  -- never narrower than a circle
+                        local bx  = gx + ox + math.floor((sz.w - bw) / 2)
+                        local by  = gy + oy + sz.h - bh - gap_bot
+
+                        paintPill(bx, by, bw, bh, bg_color)
+                        label:paintTo(bb,
+                            bx + math.floor((bw - lsz.w) / 2),
+                            by + math.floor((bh - lsz.h) / 2))
+                        label:free()
+                    end
+                end
+            end
+        end
+
+        -- ----------------------------------------------------------------
+        -- 5. Gesture handling: slider, view-toggle buttons, panel boundary
+        -- ----------------------------------------------------------------
+        local _orig_onTap = PageBrowserWidget.onTap
+        PageBrowserWidget.onTap = function(self, arg, ges)
+            logger.dbg("ZenUI page_browser: onTap at "..ges.pos.x..","..ges.pos.y)
+            -- 1. Slider tap → navigate to that page.
+            if self._zen_slider and self._zen_slider:handleTap(ges) then
+                logger.dbg("ZenUI page_browser: onTap → slider")
+                return true
+            end
+            -- 2. Skip chapter buttons.
+            if self._zen_btn_skip_left_zone
+               and self._zen_btn_skip_left_zone:contains(ges.pos) then
+                if self._zen_skip_prev then self._zen_skip_prev() end
+                return true
+            end
+            if self._zen_btn_skip_right_zone
+               and self._zen_btn_skip_right_zone:contains(ges.pos) then
+                if self._zen_skip_next then self._zen_skip_next() end
+                return true
+            end
+            -- 3. View-toggle buttons: fallback for taps before the first paintTo,
+            --    when btn.dimen.x/y are still 0 so the button's own ges_events
+            --    won't match.  After first paint, the IconButton's onTapIconButton
+            --    fires the callback directly (children-first propagation).
+            --    Use zone:contains() — GestureRange also uses contains() for
+            --    matching, so zero-area tap points on a border stay inclusive.
+            if self._zen_btn_view_zone
+               and self._zen_btn_view_zone:contains(ges.pos) then
+                logger.dbg("ZenUI page_browser: onTap → btn_view (single)")
+                if self._zen_switch_single then self._zen_switch_single() end
+                return true
+            end
+            if self._zen_btn_grid_zone
+               and self._zen_btn_grid_zone:contains(ges.pos) then
+                logger.dbg("ZenUI page_browser: onTap → btn_grid")
+                if self._zen_switch_grid then self._zen_switch_grid() end
+                return true
+            end
+            -- 4. Any tap inside the panel strip → swallow.  Without this a
+            --    tap falls through to _orig_onTap which hits the thumbnail
+            --    behind the panel, navigates the page, and the slider jumps.
+            local panel_h = self._zen_panel_h or 0
+            if panel_h > 0 and self.dimen
+               and ges.pos.y >= (self.dimen.y + self.dimen.h - panel_h) then
+                return true
+            end
+            -- 5. Thumbnail grid area → native handler.
+            return _orig_onTap(self, arg, ges)
+        end
+
+        PageBrowserWidget.onPan = function(self, arg, ges)
+            if self._zen_slider and not self._zen_slider_locked then
+                if self._zen_slider:handlePan(ges) then return true end
+            end
+            return true  -- swallow all other pans
+        end
+
+        PageBrowserWidget.onPanRelease = function(self, arg, ges)
+            if self._zen_slider
+               and self._zen_slider:handlePanRelease(ges, self, self.dimen) then
+                -- handlePanRelease fires on_change only when the slider value
+                -- actually changes; if the release lands on the same page as
+                -- the last pan, on_change won't fire and _zen_scrubbing would
+                -- stay true until the 250 ms deferred fires.  Always clean up
+                -- here so thumbnails reload immediately on finger lift.
+                if self._zen_scrubbing then
+                    UIManager:unschedule(self._zen_deferred_update)
+                    self._zen_scrubbing = false
+                    self._zen_placeholders_painted = false
+                    self._zen_post_scrub = true
+                    UIManager:unschedule(self._zen_post_scrub_clear)
+                    UIManager:scheduleIn(0.4, self._zen_post_scrub_clear)
+                    self:update()
+                end
+                return true
+            end
+            -- Swallow releases in the panel strip (e.g. near button group).
+            local panel_h = self._zen_panel_h or 0
+            if panel_h > 0 and self.dimen
+               and ges.pos.y >= (self.dimen.y + self.dimen.h - panel_h) then
+                return true
+            end
+            return true
+        end
+
+        -- ----------------------------------------------------------------
+        -- 6. Gesture lockdown: only horizontal swipe (page prev/next)
+        -- ----------------------------------------------------------------
+        PageBrowserWidget.onSwipe = function(self, _arg, ges)
+            -- A fast drag on the slider is classified as a swipe rather than
+            -- pan + pan_release; ZenSlider.handleSwipe covers both cases.
+            if self._zen_slider and not self._zen_slider_locked then
+                -- Pre-set scrubbing BEFORE handleSwipe so that on_change's
+                -- call to updateFocusPage (which triggers async tile loads)
+                -- already has the suppress flag set when was_dragging=false.
+                -- If handleSwipe doesn't claim the gesture we clear it below.
+                self._zen_scrubbing = true
+                UIManager:unschedule(self._zen_post_scrub_clear)
+                if self._zen_slider:handleSwipe(ges, self, self.dimen) then
+                    -- was_dragging=false: on_change already fired and transitioned
+                    -- to _zen_post_scrub, so _zen_scrubbing is now false. Nothing to do.
+                    -- was_dragging=true: on_change never fires; clean up here.
+                    if self._zen_scrubbing then
+                        UIManager:unschedule(self._zen_deferred_update)
+                        self._zen_scrubbing = false
+                        self._zen_placeholders_painted = false
+                        self._zen_post_scrub = true
+                        UIManager:scheduleIn(0.4, self._zen_post_scrub_clear)
+                        self:update()
+                    end
+                    return true
+                end
+                -- handleSwipe didn't claim the gesture; undo the pre-set.
+                self._zen_scrubbing = false
+                self._zen_placeholders_painted = false
+            end
+            local direction = ges.direction
+            if direction == "west" then
+                self:onScrollPageDown()
+                return true
+            elseif direction == "east" then
+                self:onScrollPageUp()
+                return true
+            elseif direction == "south" and ges.pos.y < Device.screen:getHeight() * 0.14 then
+                local ok_rui, RUI = pcall(require, "apps/reader/readerui")
+                if ok_rui and RUI and RUI.instance then
+                    local reader_menu = RUI.instance.menu
+                    if reader_menu and reader_menu.activation_menu ~= "tap" then
+                        reader_menu:onShowMenu(reader_menu:_getTabIndexFromLocation(ges))
+                        return true
+                    end
+                end
+            end
+            return true  -- swallow remaining north/south and anything else
+        end
+
+        -- Suppress hold gestures in the bottom panel area so they don't
+        -- trigger the native book-map-row popup.
+        local _orig_onHold = PageBrowserWidget.onHold
+        PageBrowserWidget.onHold = function(self, arg, ges)
+            local panel_h = self._zen_panel_h or 0
+            if panel_h > 0 and self.dimen
+               and ges.pos.y >= (self.dimen.y + self.dimen.h - panel_h) then
+                return true  -- swallow
+            end
+            if _orig_onHold then return _orig_onHold(self, arg, ges) end
+        end
+
+        PageBrowserWidget.onPinch  = function() return true end
+        PageBrowserWidget.onSpread = function() return true end
+        PageBrowserWidget.onMultiSwipe = function(self, arg, ges)
+            if self._zen_slider then
+                self._zen_slider:handleMultiSwipe(ges, self, self.dimen)
+            end
+            -- handleMultiSwipe can also terminate a drag without firing on_change.
+            if self._zen_scrubbing then
+                UIManager:unschedule(self._zen_deferred_update)
+                self._zen_scrubbing = false
+                self._zen_placeholders_painted = false
+                self._zen_post_scrub = true
+                UIManager:unschedule(self._zen_post_scrub_clear)
+                UIManager:scheduleIn(0.4, self._zen_post_scrub_clear)
+                self:update()
+            end
+            -- Swallow all multiswipes; never close the page browser.
+            return true
+        end
+    end
+
+    -- -----------------------------------------------------------------------
+    -- Open KOReader's native PageBrowserWidget (with Zen UI tweaks)
+    -- -----------------------------------------------------------------------
+    local function open_page_browser(ui)
+        local PageBrowserWidget = require("ui/widget/pagebrowserwidget")
+        zen_patch_page_browser_widget()
+        UIManager:show(PageBrowserWidget:new{ ui = ui })
+    end
+
+    -- Patch ReaderMenu.initGesListener to register the swipe-up zone
+    -- -----------------------------------------------------------------------
+    local ReaderMenu = require("apps/reader/modules/readermenu")
+    local _orig_initGesListener = ReaderMenu.initGesListener
+
+    local function register_page_browser_zone(ui)
+        ui:registerTouchZones({
+            {
+                id          = "zen_page_browser_reader",
+                ges         = "swipe",
+                screen_zone = {
+                    ratio_x = 0, ratio_y = 0.86, ratio_w = 1, ratio_h = 0.14,
+                },
+                -- Override the config-menu and page-turn swipe zones so our
+                -- north-swipe wins.  We deliberately do NOT override the tap
+                -- zones (readerconfigmenu_tap etc.) — those cause unintended
+                -- pan/brightness-slider interference via the zone sort order.
+                overrides = {
+                    "readerconfigmenu_swipe",
+                    "readerconfigmenu_ext_swipe",
+                    "paging_swipe",
+                    "rolling_swipe",
+                },
+                handler = function(ges)
+                    if not is_enabled() then return end
+                    if ges.direction == "north" then
+                        open_page_browser(ui)
+                        ui:handleEvent(Event:new("HandledAsSwipe"))
+                        return true
+                    end
+                end,
+            },
+        })
+    end
+
+    ReaderMenu.initGesListener = function(self_rm)
+        if _orig_initGesListener then
+            _orig_initGesListener(self_rm)
+        end
+        register_page_browser_zone(self_rm.ui)
+    end
+
+    -- onReaderReady is aliased to initGesListener in KOReader; keep in sync
+    ReaderMenu.onReaderReady = ReaderMenu.initGesListener
+
+    -- If a book is already open when this patch is applied (feature toggled
+    -- at runtime), register the zone immediately.
+    local ok_rui, ReaderUI = pcall(require, "apps/reader/readerui")
+    if ok_rui and ReaderUI and ReaderUI.instance then
+        pcall(register_page_browser_zone, ReaderUI.instance)
+    end
+
+    -- -----------------------------------------------------------------------
+    -- Zen UI customisations for fulltext search dialog
+    -- -----------------------------------------------------------------------
+    local ok_rs, ReaderSearch = pcall(require, "apps/reader/modules/readersearch")
+    if ok_rs and ReaderSearch then
+        local InputDialog = require("ui/widget/inputdialog")
+        local Screen_s    = require("device").screen
+        local _           = require("gettext")
+        local logger_rs   = require("logger")
+
+        local _orig_InputDialog_onTap = InputDialog.onTap
+
+        local SEARCH_ICON = "\u{F002}"
+
+        ReaderSearch.onShowFulltextSearchInput = function(self, search_string)
+            self.input_dialog = InputDialog:new{
+                title = _("Search Book"),
+                width = math.floor(math.min(Screen_s:getWidth(), Screen_s:getHeight()) * 0.9),
+                input = search_string
+                    or self.last_search_text
+                    or (self.ui.doc_settings
+                        and self.ui.doc_settings:readSetting("fulltext_search_last_search_text")),
+                -- X in the title bar (top left)
+                title_bar_left_icon = "close",
+                title_bar_left_icon_tap_callback = function()
+                    UIManager:close(self.input_dialog)
+                end,
+                buttons = {
+                    {
+                        {
+                            text             = SEARCH_ICON .. " " .. _("Search"),
+                            is_enter_default = true,
+                            callback         = function()
+                                self:searchCallback()
+                            end,
+                        },
+                    },
+                },
+            }
+            -- Always case insensitive, whole-word via regex
+            self.case_insensitive = true
+            self._zen_whole_word = true
+            self.check_button_case = { checked = false }
+            self.check_button_regex = { checked = false }
+
+            -- Tap outside = close keyboard + dialog together
+            self.input_dialog.onTap = function(dialog_self, arg, ges)
+                if dialog_self.deny_keyboard_hiding then return end
+                if dialog_self:isKeyboardVisible() then
+                    local kb = dialog_self._input_widget and dialog_self._input_widget.keyboard
+                    if kb and kb.dimen
+                       and ges.pos:notIntersectWith(kb.dimen)
+                       and ges.pos:notIntersectWith(dialog_self.dialog_frame.dimen) then
+                        dialog_self:onCloseKeyboard()
+                        UIManager:close(dialog_self)
+                        return true
+                    end
+                    return _orig_InputDialog_onTap(dialog_self, arg, ges)
+                else
+                    if ges.pos:notIntersectWith(dialog_self.dialog_frame.dimen) then
+                        UIManager:close(dialog_self)
+                        return true
+                    end
+                end
+            end
+
+            UIManager:show(self.input_dialog)
+            self.input_dialog:onShowKeyboard()
+        end
+
+        -- Whole-word matching via \b word-boundary assertions.
+        -- Note: \b is ASCII-only in ECMAScript/SRELL (matches [A-Za-z0-9_] boundaries),
+        -- so it correctly handles the Latin-script case (e.g. "red" does not match "tired").
+        -- Lookbehind/lookahead (?<!...) require SRELL 4+; older embedded SRELL versions
+        -- silently ignore them, causing every pattern to match as a substring.
+        local function make_whole_word_regex(text)
+            local escaped = text:gsub("[%^%$%.%*%+%?%(%)%[%]%{%}%|\\]", "\\%0")
+            return "\\b" .. escaped .. "\\b"
+        end
+
+        local _orig_rs_search = ReaderSearch.search
+        function ReaderSearch:search(pattern, origin, regex, case_insensitive)
+            -- Only use whole-word regex when substring mode is NOT enabled
+            if not is_substring_enabled() then
+                pattern = make_whole_word_regex(pattern)
+                regex = true
+            end
+            return _orig_rs_search(self, pattern, origin, regex, case_insensitive)
+        end
+
+        local _orig_rs_findAllText = ReaderSearch.findAllText
+        function ReaderSearch:findAllText(search_text)
+            -- Only use whole-word regex when substring mode is NOT enabled
+            if not is_substring_enabled() then
+                search_text = make_whole_word_regex(search_text)
+                self.use_regex = true
+            end
+            return _orig_rs_findAllText(self, search_text)
+        end
+
+        -- Patch onShowFindAllResults: fix reader-content ghosting at the bottom
+        -- of the screen when search results are shown.
+        --
+        -- ROOT CAUSE: Menu:new{} runs while Screen:getHeight() is still reduced
+        -- by the virtual keyboard (shown for our search InputDialog). This makes
+        -- menu.dimen.h and the internal OverlapGroup dimen height equal to the
+        -- keyboard-shrunk height (~1525 vs real 1696 on a Kobo). Menu:init()
+        -- creates its FrameContainer WITHOUT an explicit height — so the FC's
+        -- paintTo uses `self.height or my_size.h = nil or 1525 = 1525`, filling
+        -- only 1525px of white background and leaving the bottom 171px untouched
+        -- (showing through the reader content in the framebuffer).
+        --
+        -- By the time our wrapper runs (after UIManager:show(result_menu) returns),
+        -- the keyboard has been dismissed and Screen:getHeight() is back to the
+        -- real value. We patch menu.dimen.h (gesture hit range) and set an
+        -- explicit menu[1].height (FrameContainer) so its background fill covers
+        -- the full screen.  A flashui setDirty then schedules a full e-ink refresh.
+        local _orig_onShowFindAllResults = ReaderSearch.onShowFindAllResults
+        ReaderSearch.onShowFindAllResults = function(self, not_cached)
+            -- Only apply whole-word filtering when substring mode is NOT enabled
+            if not is_substring_enabled() and self._zen_whole_word and not_cached and self.findall_results then
+                local filtered = {}
+                for _i, item in ipairs(self.findall_results) do
+                    local pre = item.matched_word_prefix or ""
+                    local suf = item.matched_word_suffix or ""
+                    if pre == "" and suf == "" then
+                        table.insert(filtered, item)
+                    end
+                end
+                self.findall_results = filtered
+            end
+
+            _orig_onShowFindAllResults(self, not_cached)
+            local menu = self.result_menu
+            if not menu or not UIManager:isWidgetShown(menu) then return end
+
+            local real_h = Screen_s:getHeight()
+
+            -- Fix outer dimen so gesture hit-testing covers the full screen.
+            if menu.dimen and menu.dimen.h < real_h then
+                logger_rs.info("ZenUI [search] fixing menu height:", menu.dimen.h, "→", real_h)
+                menu.dimen.h = real_h
+            end
+
+            -- Force an explicit height on the FrameContainer so its white
+            -- background fill (container_height = self.height or my_size.h)
+            -- extends to the full screen rather than stopping at the
+            -- keyboard-shrunk OverlapGroup height.
+            local fc = menu[1]
+            if fc then
+                fc.height = real_h
+            end
+
+            UIManager:setDirty(menu, "flashui")
+
+            -- Extend close_callback to mark the reader view dirty after the
+            -- results menu is dismissed.  Without this the clock overlay drawn
+            -- by ReaderView.paintTo may not be repainted because the guard in
+            -- that patch skips drawing while a non-reader widget is on top, and
+            -- the subsequent UIManager repaint cycle can miss re-invoking paintTo.
+            if menu.close_callback then
+                local orig_close_cb = menu.close_callback
+                menu.close_callback = function()
+                    orig_close_cb()
+                    if self.view then
+                        UIManager:setDirty(self.view, "partial")
+                    end
+                end
+            end
+        end
+    end
+
+    -- -----------------------------------------------------------------------
+    -- Primary intercept: patch ReaderConfig.onSwipeShowConfigMenu directly.
+    -- More reliable than zone-override ordering since it does not depend on
+    -- the dep-graph re-serialisation happening in the right order.
+    -- -----------------------------------------------------------------------
+    local function is_bottom_swipe_enabled()
+        local features = _plugin_ref
+            and _plugin_ref.config
+            and _plugin_ref.config.features
+        if type(features) ~= "table" then return false end
+        if not (features.page_browser == true or features.reader_bottom_menu == true) then return false end
+        if features.lockdown_mode == true then
+            local lc = _plugin_ref.config.lockdown
+            if type(lc) == "table" and lc.disable_bottom_menu_swipe then return false end
+        end
+        return true
+    end
+
+    local ok_rc, ReaderConfig = pcall(require, "apps/reader/modules/readerconfig")
+    if ok_rc and ReaderConfig then
+        local _orig_onSwipeShowConfigMenu = ReaderConfig.onSwipeShowConfigMenu
+        ReaderConfig.onSwipeShowConfigMenu = function(self_rc, ges)
+            if is_enabled() and ges.direction == "north" then
+                open_page_browser(self_rc.ui)
+                self_rc.ui:handleEvent(Event:new("HandledAsSwipe"))
+                return true
+            end
+            -- suppress native config menu swipe when bottom swipe is disabled
+            if not is_bottom_swipe_enabled() then return end
+            if _orig_onSwipeShowConfigMenu then
+                return _orig_onSwipeShowConfigMenu(self_rc, ges)
+            end
+        end
+
+        -- suppress bottom tap opening the native config menu when Zen owns the zone
+        local _orig_onTapShowConfigMenu = ReaderConfig.onTapShowConfigMenu
+        ReaderConfig.onTapShowConfigMenu = function(self_rc)
+            if is_bottom_swipe_enabled() then return end
+            if _orig_onTapShowConfigMenu then
+                return _orig_onTapShowConfigMenu(self_rc)
+            end
+        end
+    end
+
+end -- apply_page_browser
+
+return apply_page_browser
