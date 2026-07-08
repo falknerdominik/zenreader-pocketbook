@@ -41,7 +41,6 @@ dist/
 build/
 out/
 target/
-bin/
 obj/
 
 # Cache / temp files
