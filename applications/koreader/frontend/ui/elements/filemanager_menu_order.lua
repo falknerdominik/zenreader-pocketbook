@@ -41,6 +41,7 @@ local order = {
         "document_metadata_location",
         "document_metadata_location_move",
         "document_auto_save",
+        "document_metadata_arc",
         "document_end_action",
         "language_support",
     },
@@ -124,6 +125,7 @@ local order = {
         "exporter",
         "statistics",
         "cloud_storage",
+        "cloudstorage",
         "move_to_archive",
         "wallabag",
         "news_downloader",
@@ -188,6 +190,7 @@ local order = {
         "search_menu",
         "----------------------------",
         "report_bug",
+        "plugins_disable_external",
         "----------------------------",
         "system_statistics", -- if enabled (Plugin)
         "version",

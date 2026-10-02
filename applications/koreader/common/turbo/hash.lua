@@ -31,7 +31,7 @@ local ffi = require "ffi"
 local buffer = require "turbo.structs.buffer"
 require "turbo.cdef"
 
-local lssl = ffi.load(os.getenv("TURBO_LIBSSL") or "ssl")
+local lssl = ffi.loadlib("ssl", "60")
 
 -- Buffers
 local hexstr = buffer()

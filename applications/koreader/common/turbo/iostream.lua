@@ -29,7 +29,6 @@ local buffer =      require "turbo.structs.buffer"
 local socket =      require "turbo.socket_ffi"
 local sockutils =   require "turbo.sockutil"
 local util =        require "turbo.util"
-local signal =      require "turbo.signal"
 -- __Global value__ _G.TURBO_SSL allows the user to enable the SSL module.
 local crypto =      require "turbo.crypto"
 local platform =    require "turbo.platform"

@@ -8,6 +8,7 @@ local bit = require("bit")
 local ffi = require("ffi")
 local C = ffi.C
 local lfs = require("libs/libkoreader-lfs")
+local posix = require("ffi/posix")
 
 local lshift = bit.lshift
 local band = bit.band
@@ -59,8 +60,6 @@ int WideCharToMultiByte(
     LPBOOL lpUsedDefaultChar
 );
 ]]
-
-require("ffi/posix_h")
 
 local util = {}
 
@@ -298,6 +297,30 @@ function util.removeRunInSubProcessAfterForkFunc(id)
     _run_in_subprocess_after_fork_funcs[id] = nil
 end
 
+-- Frontend can register functions to be run in the parent just before fork().
+-- Useful for stopping background threads (e.g. SDL gamepad thread) that may
+-- hold internal locks, which would cause fork()'s glibc atfork prepare handler
+-- to block indefinitely on systems with scheduling-intensive schedulers
+-- (e.g. CachyOS BORE/LAVD).
+local _run_before_fork_funcs = {}
+function util.addRunBeforeForkFunc(id, func)
+    _run_before_fork_funcs[id] = func
+end
+function util.removeRunBeforeForkFunc(id)
+    _run_before_fork_funcs[id] = nil
+end
+
+-- Frontend can register functions to be run in the parent just after fork()
+-- returns, regardless of success or failure.  Used to re-initialize subsystems
+-- that were stopped by a before-fork hook.
+local _run_after_fork_parent_funcs = {}
+function util.addRunAfterForkParentFunc(id, func)
+    _run_after_fork_parent_funcs[id] = func
+end
+function util.removeRunAfterForkParentFunc(id)
+    _run_after_fork_parent_funcs[id] = nil
+end
+
 --- Run lua code (func) in a forked subprocess
 --
 -- With with_pipe=true, sets up a pipe for communication
@@ -315,18 +338,36 @@ end
 --                       as waitpid will return -1 w/ an ECHILD errno.
 -- NOTE: Assumes the target platform is POSIX compliant.
 function util.runInSubProcess(func, with_pipe, double_fork)
-    local parent_read_fd, child_write_fd
+    local parent_read_fd, parent_write_fd
+    local child_read_fd, child_write_fd
     if with_pipe then
         local pipe = ffi.new('int[2]', {-1, -1})
         if C.pipe(pipe) ~= 0 then -- failed creating pipe !
-            return false, "failed creating pipe: "..ffi.string(C.strerror(ffi.errno()))
+            return false, "failed creating pipe: "..posix.strerror()
         end
         parent_read_fd, child_write_fd = pipe[0], pipe[1]
-        if parent_read_fd == -1 or child_write_fd == -1 then
-            return false, "failed getting pipe read or write fd: "..ffi.string(C.strerror(ffi.errno()))
+        if with_pipe == 'bidi' then
+            if C.pipe(pipe) ~= 0 then -- failed creating pipe !
+                return false, "failed creating pipe: "..posix.strerror()
+            end
+            parent_write_fd, child_read_fd = pipe[1], pipe[0]
         end
     end
+    -- Run before-fork hooks in the parent.  Callers (e.g. the SDL backend) use
+    -- this to stop subsystem threads that may hold glibc malloc arena locks.
+    -- If such a thread is mid-malloc when fork() is called, glibc's atfork
+    -- prepare handler will block waiting for the lock, freezing the UI.
+    for _, f in pairs(_run_before_fork_funcs) do
+        f()
+    end
     local pid = C.fork()
+    -- Run after-fork-parent hooks immediately, before any error checking, so
+    -- that subsystems stopped above are always restarted.
+    if pid ~= 0 then
+        for _, f in pairs(_run_after_fork_parent_funcs) do
+            f()
+        end
+    end
     if pid == 0 then -- child process
         for _, f in pairs(_run_in_subprocess_after_fork_funcs) do
             f()
@@ -335,8 +376,7 @@ function util.runInSubProcess(func, with_pipe, double_fork)
             pid = C.fork()
             if pid ~= 0 then
                 -- Parent side of the outer fork, we don't need it anymore, so just exit.
-                -- NOTE: Technically ought to be _exit, not exit.
-                os.exit((pid < 0) and 1 or 0)
+                C._exit((pid < 0) and 1 or 0)
             end
             -- pid == 0 -> inner child :)
         end
@@ -352,9 +392,12 @@ function util.runInSubProcess(func, with_pipe, double_fork)
             -- util.isSubProcessDone() returning false until all the child's
             -- children are done.
             C.setpgid(0, 0)
+            -- close our duplicate parent fds
             if parent_read_fd then
-                -- close our duplicate of parent fd
                 C.close(parent_read_fd)
+            end
+            if parent_write_fd then
+                C.close(parent_write_fd)
             end
 
             -- As the name imply, this is a non-interactive background task.
@@ -373,16 +416,16 @@ function util.runInSubProcess(func, with_pipe, double_fork)
             -- to communicate with parent process.
             -- We pass child_write_fd (if with_pipe) so 'func' can write to it
             pid = C.getpid()
-            func(pid, child_write_fd)
+            func(pid, child_write_fd, child_read_fd)
         end, debug.traceback)
         if not ok then
             print("error in subprocess:", err)
         end
-        os.exit(0)
+        C._exit(0)
     end
     -- parent/main process
     if pid < 0 then -- on failure, fork() returns -1
-        return false, "fork failed: "..ffi.string(C.strerror(ffi.errno()))
+        return false, "fork failed: "..posix.strerror()
     end
     -- If we double-fork, reap the outer fork now, since its only purpose is fork -> _exit
     if double_fork then
@@ -390,14 +433,17 @@ function util.runInSubProcess(func, with_pipe, double_fork)
         local ret = C.waitpid(pid, status, 0)
         -- Returns pid on success, -1 on failure
         if ret < 0 then
-            return false, "double fork failed: "..ffi.string(C.strerror(ffi.errno()))
+            return false, "double fork failed: "..posix.strerror()
         end
     end
+    -- close our duplicate child fds
+    if child_read_fd then
+        C.close(child_read_fd)
+    end
     if child_write_fd then
-        -- close our duplicate of child fd
         C.close(child_write_fd)
     end
-    return pid, parent_read_fd
+    return pid, parent_read_fd, parent_write_fd
 end
 
 --- Collect subprocess so it does not become a zombie.
@@ -450,7 +496,7 @@ function util.getNonBlockingReadSize(fd_or_luafile)
     local available = ffi.new('int[1]')
     local ok = C.ioctl(fileno, C.FIONREAD, available)
     if ok ~= 0 then -- ioctl failed, not supported
-        print("C.ioctl(…, FIONREAD, …) failed:", ffi.string(C.strerror(ffi.errno())))
+        print("C.ioctl(…, FIONREAD, …) failed:", posix.strerror())
         return
     end
     available = tonumber(available[0])
@@ -483,14 +529,14 @@ function util.writeToSysfs(val, file)
     --       as it only reports failures to write to the *stream*, not to the disk/file!).
     local fd = C.open(file, bit.bor(C.O_WRONLY, C.O_CLOEXEC)) -- procfs/sysfs, we shouldn't need O_TRUNC
     if fd == -1 then
-        print("Cannot open file `" .. file .. "`:", ffi.string(C.strerror(ffi.errno())))
+        print("Cannot open file `" .. file .. "`:", posix.strerror())
         return
     end
     val = tostring(val)
     local bytes = #val
     local nw = C.write(fd, val, bytes)
     if nw == -1 then
-        print("Cannot write `" .. val .. "` to file `" .. file .. "`:", ffi.string(C.strerror(ffi.errno())))
+        print("Cannot write `" .. val .. "` to file `" .. file .. "`:", posix.strerror())
     end
     C.close(fd)
     -- NOTE: Allows the caller to possibly handle short writes (not that these should ever happen here).
@@ -507,8 +553,7 @@ function util.readAllFromFD(fd)
         -- print("reading from fd")
         local bytes_read = tonumber(C.read(fd, ffi.cast('void*', buffer), chunksize))
         if bytes_read < 0 then
-            local err = ffi.errno()
-            print("readAllFromFD() error: "..ffi.string(C.strerror(err)))
+            print("readAllFromFD() error: "..posix.strerror())
             break
         elseif bytes_read == 0 then -- EOF, no more data to read
             break
@@ -545,8 +590,7 @@ function util.fsyncOpenedFile(fd_or_luafile, sync_metadata)
         ret = C.fdatasync(fileno) -- sync only file data
     end
     if ret ~= 0 then
-        local err = ffi.errno()
-        return false, ffi.string(C.strerror(err))
+        return false, posix.strerror()
     end
     return true
 end
@@ -572,8 +616,7 @@ function util.fsyncDirectory(path)
     end
     local dirfd = C.open(ffi.cast("char *", path), bit.bor(C.O_RDONLY, C.O_CLOEXEC))
     if dirfd == -1 then
-        err = ffi.errno()
-        return false, ffi.string(C.strerror(err))
+        return false, posix.strerror()
     end
     -- Not certain it's safe to use fdatasync(), so let's go with the more costly fsync()
     -- https://austin-group-l.opengroup.narkive.com/vC4Fjvsn/fsync-ing-a-directory-file-descriptor
@@ -581,7 +624,7 @@ function util.fsyncDirectory(path)
     if ret ~= 0 then
         err = ffi.errno()
         C.close(dirfd)
-        return false, ffi.string(C.strerror(err))
+        return false, posix.strerror(err)
     end
     C.close(dirfd)
     return true

@@ -4,7 +4,6 @@ local Notification = require("ui/widget/notification")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
-local random = require("random")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -67,14 +66,15 @@ function ReaderAnnotation:buildAnnotation(bm, highlights, init)
     return { -- annotation
         datetime         = bm.datetime, -- creation time, not changeable
         datetime_updated = nil,         -- last modification time
-        drawer           = hl.drawer,   -- highlight drawer
+        drawer           = hl.drawer,   -- highlight style
         color            = hl.color,    -- highlight color
         text             = bm.notes,    -- highlighted text, editable
         text_edited      = hl.edited,   -- true if highlighted text has been edited
         note             = note,        -- user's note, editable
+        note_format      = nil,         -- plain text, or "html" or "md"
         chapter          = chapter,     -- book chapter title
         pageno           = pageno,      -- book page number (continuous numbering, used by KOHighlights)
-        pageref          = pageref,     -- book page number (iff: reference pages or hidden flows)
+        pageref          = pageref,     -- book page number (iff: stable pages or hidden flows)
         page             = bm.page,     -- highlight location, xPointer or number (pdf)
         pos0             = bm.pos0,     -- highlight start position, xPointer (== page) or table (pdf)
         pos1             = bm.pos1,     -- highlight end position, xPointer or table (pdf)
@@ -263,7 +263,7 @@ function ReaderAnnotation:onExportAnnotations(on_closing)
     if do_export and self:hasAnnotations() then
         local file = self:getExportAnnotationsFilepath()
         local anno = LuaSettings:open(file)
-        local device_id = G_reader_settings:readSetting("device_id", random.uuid())
+        local device_id = G_reader_settings:readSetting("device_id")
         anno:saveSetting("device_id", device_id)
         anno:saveSetting("datetime", os.date("%Y-%m-%d %H:%M:%S"))
         anno:saveSetting("paging", self.ui.paging and true)
