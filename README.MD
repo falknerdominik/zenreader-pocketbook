@@ -13,7 +13,7 @@ It provides an easy-to-replicate setup with:
 * Random lock-screen images from `/Photos`.
 * Documented system changes that others can reuse.
 
-> **Compatibility:** Tested on the PocketBook Era Lite **PB710** running firmware **6.10.x**.
+> **Compatibility:** Tested on the PocketBook Era Lite **PB710** running firmware **U710.6.11.2124**. For Firmware **U710.6.10.** use this repository at commit `05ea7c4`.
 
 <p align="center">
   <strong>Did ZenReader save you setup time?</strong><br>
