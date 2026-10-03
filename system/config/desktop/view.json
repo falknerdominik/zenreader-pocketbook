@@ -1,6 +1,13 @@
 {
-    "version": "7",
+    "version": "8",
     "applications": {
+        "U_Koreader": {
+            "path": "/mnt/ext1/applications/koreader.app",
+            "title": "KOReader",
+            "icon": { "path": "applications/icons/desktop_app_koreader.bmp" },
+            "focused_icon": { "path": "applications/icons/desktop_app_koreader_f.bmp" }
+        },
+
         "_comment": [
             "Fields - application key id, must start from \"U_\" for user application\n",
             "Support application subfields:\n",
@@ -27,14 +34,9 @@
             "     \"focused_icon\": { \"path\": \"applications/icons/my_calc_icon_f.bmp\" }\n",
             "   }\n",
             "end."
-        ],
-	"U_koreader": {
-	  "path": "/mnt/ext1/applications/koreader.app",
-	  "title": "KOReader",
-	  "icon": "/mnt/ext1/applications/icons/desktop_app_koreader.bmp",
-	  "focused_icon": "/mnt/ext1/applications/icons/desktop_app_koreader_f.bmp"
-	}
+        ]
     },
+
     "view": {
         "_comment": [
             "\"groups\" - array of application groups\n",
@@ -44,11 +46,13 @@
             "> \"sort\" - applications sort type (\"title\", \"fixed\" or special property of applications) (Optional, \"title\" by default)\n",
             "end."
         ],
+
         "groups": [
             {
                 "title": "@General",
                 "sort": "title",
                 "apps": [
+                    "U_Koreader",
                     "PB_AudioBooks",
                     "PB_Browser",
                     "PB_Bookstore",
@@ -66,9 +70,10 @@
                     "PB_RSSNews",
                     "PB_Overdrive",
                     "PB_Settings",
-                    "U_koreader"
+                    "PB_Marschpat"
                 ]
             },
+
             {
                 "title": "@Services",
                 "sort": "title",
@@ -76,9 +81,10 @@
                     "PB_Dropbox",
                     "PB_Cloud",
                     "PB_SendToPB",
-		    "PB_Bookstore2empikgo"
+                    "PB_Bookstore2empikgo"
                 ]
             },
+
             {
                 "title": "@Games",
                 "sort": "title",
