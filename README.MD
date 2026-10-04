@@ -89,12 +89,3 @@ The icon was added to the system menu in:
 ```text
 system/config/desktop/view.json
 ```
-
-#### Application name
-
-The default `@koreader` label was renamed to `KOReader` in:
-
-```text
-system/language/en.txt
-```
-
