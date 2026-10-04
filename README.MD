@@ -89,3 +89,15 @@ The icon was added to the system menu in:
 ```text
 system/config/desktop/view.json
 ```
+
+## FAQ
+### Why do I see both `KOReader` and `@_koreader` in the application list?
+
+The `@_koreader` entry is usually caused by a hidden or stray KOReader launcher file in the PocketBook `applications` folder.
+
+PocketBook scans this folder automatically and may create an additional launcher entry for that file, resulting in both:
+
+- `KOReader`
+- `@_koreader`
+
+To fix it, open the `applications` folder on the device and delete the hidden/stray `@_koreader` file. Keep the `koreader.app` file.
