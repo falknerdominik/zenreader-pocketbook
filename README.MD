@@ -46,17 +46,7 @@ cp -r <source>/* <pocketbook-mount-point>/
 
 ### KOReader
 
-KOReader is the centerpiece of ZenReader.
-
-Support for the PB710 was manually added by adapting:
-
-```text
-applications/koreader/frontend/device/pocketbook/device.lua
-```
-
-This work is based on [KOReader pull request #15415](https://github.com/koreader/koreader/pull/15415).
-
-The functional additions to KOReader are limited to the following three plugins.
+No additional changes. Koreader Version 2026-07.
 
 ### Plugins
 
